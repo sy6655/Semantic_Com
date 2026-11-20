@@ -1,6 +1,7 @@
 """Train gains of the 64 Q^T-transformed ImageNet transmission blocks."""
 
 import argparse
+import math
 import os
 from pathlib import Path
 
@@ -19,9 +20,10 @@ from orthogonal_power import (
     allocator_fingerprint, prepare_gain_estimator_input, sample_raw_channel,
 )
 from train_power_allocator import (
-    PowerAllocator, RayleighFadingChannel, allocate_power, encode_latents,
-    build_logger, cleanup_distributed, initialize_distributed,
-    install_termination_handlers, save_config, unwrap_model,
+    PowerAllocator, RayleighFadingChannel, WarmupCosineLR, allocate_power, encode_latents,
+    build_logger, build_training_scheduler, cleanup_distributed, initialize_distributed,
+    install_termination_handlers, optimizer_step_with_schedule, save_config,
+    training_schedule_config, unwrap_model,
 )
 
 
@@ -79,6 +81,12 @@ def run_training():
     parser.add_argument("--hidden_dim", type=int, default=256,
                         help="Global MLP hidden width; v4 default is 2946->256->64")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--warmup_epochs", type=float, default=0.5,
+                        help="Linear warmup duration for new training, measured in epochs")
+    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
+                        help="Warmup initial LR / peak LR")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.5,
+                        help="Final cosine LR / peak LR; updated after each optimizer step")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--snr_db_min", type=float, default=-10)
     parser.add_argument("--snr_db_max", type=float, default=20)
@@ -94,6 +102,12 @@ def run_training():
     args = parser.parse_args()
     if min(args.batch, args.epochs, args.hidden_dim, args.log_interval) <= 0 or args.lr <= 0:
         parser.error("batch, epochs, hidden_dim, log_interval and lr must be positive")
+    if not math.isfinite(args.warmup_epochs) or not 0 <= args.warmup_epochs < args.epochs:
+        parser.error("warmup_epochs must be in [0,epochs)")
+    if not math.isfinite(args.warmup_start_factor) or not 0 <= args.warmup_start_factor <= 1:
+        parser.error("warmup_start_factor must be in [0,1]")
+    if not math.isfinite(args.min_lr_ratio) or not 0 <= args.min_lr_ratio <= 1:
+        parser.error("min_lr_ratio must be in [0,1]")
     if args.snr_db_min > args.snr_db_max:
         parser.error("snr_db_min must not exceed snr_db_max")
     device, distributed, rank, world_size = initialize_distributed(args.device, args.local_rank)
@@ -119,8 +133,8 @@ def run_training():
     if distributed:
         options = {"device_ids": [args.local_rank]} if device.type == "cuda" else {}
         estimator = DistributedDataParallel(estimator, **options)
-    optimizer = torch.optim.AdamW(estimator.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    parameters = list(estimator.parameters())
+    optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
     amp_enabled = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     output_dir = Path("checkpoints_gain_estimator") / "ImageNet" / args.exp_name
@@ -149,7 +163,7 @@ def run_training():
                   estimator_output="log_transmit_amplitude_gain", loss="log_gain_mse",
                   precision="abs(h)^2*a_hat^2/N0", noise_real_component_variance=NOISE_REAL_COMPONENT_VARIANCE,
                   uses_reverse_diffusion=False, world_size=world_size)
-    start_epoch, global_step = 0, 0
+    start_epoch, global_step, previous = 0, 0, None
     if args.resume:
         previous = torch.load(args.resume, map_location=device, weights_only=False)
         for key in ("allocator_fingerprint", "hidden_dim", "patch_shape", "channel_model", "estimator_version",
@@ -157,12 +171,17 @@ def run_training():
             if previous["config"].get(key) != config[key]:
                 raise ValueError(f"Resume checkpoint mismatch: {key}")
         unwrap_model(estimator).load_state_dict(previous["estimator"])
-        optimizer.load_state_dict(previous["optimizer"])
-        scheduler.load_state_dict(previous["scheduler"])
         scaler.load_state_dict(previous["scaler"])
         start_epoch, global_step = previous["epoch"] + 1, previous["global_step"]
+    scheduler = build_training_scheduler(
+        optimizer, args.epochs, len(train_loader), args.warmup_epochs,
+        args.warmup_start_factor, args.min_lr_ratio, previous,
+    )
+    config.update(lr_schedule=training_schedule_config(scheduler), lr_steps_per_epoch=len(train_loader))
     if rank == 0:
         save_config(output_dir / "config.json", config)
+    logger.info("lr_schedule=%s resumed=%s next_lr_estimator=%.8g",
+                config["lr_schedule"], previous is not None, optimizer.param_groups[0]["lr"])
     for epoch in range(start_epoch, args.epochs):
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -173,6 +192,7 @@ def run_training():
             totals = torch.zeros(3, device=device, dtype=torch.float64)
             generator = torch.Generator(device=device).manual_seed(args.seed + rank)
             for batch_index, (images, _) in enumerate(loader):
+                batch_lr = optimizer.param_groups[0]["lr"]
                 images = images.to(device, non_blocking=True)
                 snr = args.snr_db_min + (args.snr_db_max - args.snr_db_min) * torch.rand(
                     images.shape[0], device=device, generator=None if training else generator
@@ -191,23 +211,21 @@ def run_training():
                     raise FloatingPointError("Non-finite gain estimator loss")
                 if training:
                     scaler.scale(result["loss"]).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(estimator.parameters(), args.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    optimizer_step_with_schedule(optimizer, scheduler, scaler, parameters, args.grad_clip)
                     global_step += 1
                 size = images.shape[0]
                 totals += torch.tensor([result["loss"].item() * size,
                                         result["gain_relative_mae"].item() * size, size], device=device)
                 if batch_index == 0 or (batch_index + 1) % args.log_interval == 0:
-                    logger.info("epoch=%d phase=%s batch=%d/%d log_gain_mse=%.6f relative_mae=%.4f",
+                    logger.info("epoch=%d phase=%s batch=%d/%d log_gain_mse=%.6f relative_mae=%.4f lr_estimator=%.8g",
                                 epoch + 1, phase, batch_index + 1, len(loader), result["loss"].item(),
-                                result["gain_relative_mae"].item())
+                                result["gain_relative_mae"].item(), batch_lr)
             if distributed:
                 dist.all_reduce(totals)
             metrics[phase] = {"log_gain_mse": (totals[0] / totals[2]).item(),
                               "gain_relative_mae": (totals[1] / totals[2]).item()}
-        scheduler.step()
+        if not isinstance(scheduler, WarmupCosineLR):
+            scheduler.step()
         if rank == 0:
             torch.save({"estimator": unwrap_model(estimator).state_dict(), "config": config,
                         "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),

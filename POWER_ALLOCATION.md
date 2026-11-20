@@ -50,6 +50,23 @@ I/Q 두 성분을 묶은 complex channel use 수는 8,192이며, complex symbol�
 평균 에너지는 2입니다. `mean_real_component_power`와 `mean_symbol_power`로
 두 기준을 구분해 기록합니다. allocated와 uniform 전략 모두 같은 에너지 제약을 사용합니다.
 allocator에 지정한 학습률은 Q에도 적용됩니다.
+분류 allocator, segmentation allocator, gain estimator의 새 학습은 공통으로
+optimizer step마다 LR을 갱신합니다. 기본 `--warmup_epochs 0.5` 동안 최대 LR의
+10%에서 100%로 선형 증가한 뒤, 남은 학습 기간에는 cosine으로 최대 LR의 50%까지
+감소합니다. 다음 옵션을 세 학습 코드에서 동일하게 사용할 수 있습니다.
+
+```bash
+--warmup_epochs 0.5 --warmup_start_factor 0.1 --min_lr_ratio 0.5
+```
+
+`--lr 1e-3`이면 warmup 시작 LR은 `1e-4`, 최대 LR은 `1e-3`, 최종 LR은
+`5e-4`입니다. Allocator와 task model에 다른 LR을 지정하면 각자의 최대 LR에
+같은 비율을 적용합니다. Validation과 AMP가 건너뛴 optimizer update에서는 LR을
+진행하지 않습니다. 실제 스케줄은 `config.json`의 `lr_schedule`과 `train.log`에 기록합니다.
+총 epoch 기본값은 분류 10, segmentation 100, gain estimator 40입니다.
+`--resume`은 저장된 optimizer/scheduler를 복원합니다. 기존 epoch-cosine
+체크포인트는 기존 스케줄을 유지하며, 새 옵션으로 재개 스케줄을 덮어쓰지 않습니다.
+
 매 epoch 종료 시 `latest.pth`를 갱신하고, 기본 5 epoch마다
 `epoch_005.pth`, `epoch_010.pth`처럼 별도 checkpoint를 보관합니다.
 마지막 epoch도 별도 보관합니다. `--save_every 10`으로 간격을 바꿀 수 있고,
@@ -162,6 +179,13 @@ checkpoint의 학습 Q와 allocator를 그대로 사용합니다. Checkpoint를 
 사용합니다. 수신 모드를 생략하면 estimator checkpoint가 있을 때 gain estimator,
 없을 때 oracle을 선택합니다. `--channel_model rayleigh`와
 `--restoration_method dps`도 명시적으로 선택하실 수 있습니다.
+Classification의 `power_allocation.png`는 전략별 실제/추정 SD1.5 diffusion
+timestep 맵을 표시합니다. 실제 noise 분산은 `N0/(abs(h)^2*a_b^2)`, 추정 noise
+분산은 수신기의 추정 precision의 역수로 계산하며, 기존 SD1.5 변환을 사용합니다.
+두 열 모두 0~999 색상 범위를 공유하고 셀에는 블록 ID와 정수 timestep을 표시합니다.
+Oracle 수신의 오른쪽 열은 `Receiver timestep (oracle)`이며 실제 맵과 같습니다.
+범위 초과 noise는 표시할 때만 999로 제한합니다. 원래 precision과 복원 계산은
+유지하며, `true_timestep`과 `estimated_timestep`을 JSON과 baseband 파일에도 저장합니다.
 아래는 기존 DPS 설정을 명시한 예제입니다.
 
 ```bash

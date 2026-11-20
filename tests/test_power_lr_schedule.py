@@ -229,6 +229,102 @@ class PowerLRScheduleTests(unittest.TestCase):
                 for handler in training.logging.getLogger("train_power_allocator").handlers:
                     handler.close()
 
+    def test_gain_training_step_schedule_validation_and_new_or_legacy_resume(self):
+        import train_gain_estimator as gain_training
+
+        class TinyVAE(torch.nn.Module):
+            config = SimpleNamespace(latent_channels=4)
+
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            train_loader = DataLoader(TensorDataset(torch.rand(5, 3, 64, 64), torch.zeros(5)), batch_size=2)
+            val_loader = DataLoader(TensorDataset(torch.rand(2, 3, 64, 64), torch.zeros(2)), batch_size=1)
+            frozen_allocator = torch.nn.Linear(2, 2).eval().requires_grad_(False)
+            transmitter_config = {"image_size": 64, "latent_channels": 4, "data_path": directory,
+                                  "vae_model_id": "unused", "vae_model_revision": None}
+            updates, validation_steps, used_lrs = [], [], []
+            active_scheduler = None
+
+            def update(optimizer, scheduler, scaler, parameters, grad_clip):
+                nonlocal active_scheduler
+                active_scheduler = scheduler
+                used_lrs.append(optimizer.param_groups[0]["lr"])
+                applied = optimizer_step_with_schedule(optimizer, scheduler, scaler, parameters, grad_clip)
+                updates.append(applied)
+                return applied
+
+            def gain_step(images, vae, allocator, channel, estimator, *args):
+                if not torch.is_grad_enabled():
+                    validation_steps.append(active_scheduler.last_epoch)
+                loss = sum(parameter.square().sum() for parameter in estimator.parameters()) * .0001
+                return {"loss": loss, "gain_relative_mae": loss.detach().new_tensor(.1)}
+
+            checkpoint_path = Path("checkpoints_gain_estimator/ImageNet/tiny_gain/latest.pth")
+
+            def run(epochs, resume=None):
+                argv = ["train_gain_estimator.py", "--allocator_checkpoint", "allocator.pth",
+                        "--exp_name", "tiny_gain", "--device", "cpu", "--hidden_dim", "8",
+                        "--epochs", str(epochs), "--batch", "2", "--log_interval", "1000"]
+                if resume is not None:
+                    argv.extend(["--resume", str(resume)])
+                try:
+                    with patch("sys.argv", argv), \
+                            patch.object(gain_training, "initialize_distributed", return_value=(torch.device("cpu"), False, 0, 1)), \
+                            patch.object(gain_training, "load_transmitter", return_value=(frozen_allocator, None, transmitter_config, Path("allocator.pth"))), \
+                            patch.object(gain_training.AutoencoderKL, "from_pretrained", return_value=TinyVAE()), \
+                            patch.object(gain_training, "construct_dataloaders", return_value=(train_loader, val_loader)), \
+                            patch.object(gain_training, "gain_estimator_step", side_effect=gain_step), \
+                            patch.object(gain_training, "optimizer_step_with_schedule", side_effect=update):
+                        gain_training.run_training()
+                finally:
+                    logger = training.logging.getLogger("train_power_allocator")
+                    for handler in logger.handlers[:]:
+                        handler.close()
+                        logger.removeHandler(handler)
+                return torch.load(checkpoint_path, weights_only=False)
+
+            checkpoint = run(2)
+            self.assertEqual(updates, [True] * 6)
+            self.assertEqual(validation_steps, [3, 3, 6, 6])
+            self.assertEqual(used_lrs[:3], [.0001, .00055, .001])
+            self.assertEqual(checkpoint["global_step"], 6)
+            self.assertEqual(checkpoint["scheduler"]["last_epoch"], 6)
+            self.assertEqual(checkpoint["scheduler"]["warmup_steps"], 2)
+            self.assertEqual(checkpoint["config"]["lr_schedule"]["interval"], "optimizer_step")
+            self.assertEqual(checkpoint["optimizer"]["param_groups"][0]["lr"], .0005)
+            self.assertTrue(all(parameter.grad is None for parameter in frozen_allocator.parameters()))
+
+            for legacy in (False, True):
+                with self.subTest(legacy=legacy):
+                    previous = copy.deepcopy(checkpoint)
+                    if legacy:
+                        parameter = torch.nn.Parameter(torch.ones(()))
+                        optimizer = torch.optim.AdamW([parameter], lr=.001)
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40)
+                        for _ in range(2):
+                            optimizer.step()
+                            scheduler.step()
+                        previous["scheduler"] = scheduler.state_dict()
+                        previous["optimizer"]["param_groups"][0]["lr"] = scheduler.get_last_lr()[0]
+                    resume_path = Path("legacy.pth" if legacy else "step.pth")
+                    torch.save(previous, resume_path)
+                    updates.clear()
+                    validation_steps.clear()
+                    used_lrs.clear()
+                    resumed = run(3, resume_path)
+                    self.assertEqual(used_lrs[0], previous["optimizer"]["param_groups"][0]["lr"])
+                    self.assertEqual(resumed["global_step"], 9)
+                    self.assertEqual(updates, [True] * 3)
+                    if legacy:
+                        self.assertEqual(validation_steps, [2, 2])
+                        self.assertEqual(resumed["scheduler"]["last_epoch"], 3)
+                        self.assertEqual(resumed["scheduler"]["T_max"], 40)
+                        self.assertEqual(resumed["config"]["lr_schedule"]["interval"], "epoch")
+                    else:
+                        self.assertEqual(validation_steps, [9, 9])
+                        self.assertEqual(resumed["scheduler"]["last_epoch"], 9)
+                        self.assertEqual(resumed["scheduler"]["total_steps"], 6)
+                        self.assertEqual(resumed["optimizer"]["param_groups"][0]["lr"], .0005)
+
 
 if __name__ == "__main__":
     unittest.main()

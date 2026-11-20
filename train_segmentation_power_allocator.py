@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 from pathlib import Path
@@ -27,15 +28,19 @@ from train_power_allocator import (
     VAE_MODEL_REVISION,
     VAE_SCALE,
     PowerAllocator,
+    WarmupCosineLR,
     QuantizedAWGNChannel,
     RayleighFadingChannel,
     allocate_power,
     build_logger,
+    build_training_scheduler,
     cleanup_distributed,
     encode_latents,
     initialize_distributed,
     install_termination_handlers,
+    optimizer_step_with_schedule,
     save_config,
+    training_schedule_config,
     unwrap_model,
 )
 from power_utils import sd15_alpha_bars
@@ -365,6 +370,12 @@ def run_training() -> None:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--allocator_lr", type=float, default=None)
+    parser.add_argument("--warmup_epochs", type=float, default=0.5,
+                        help="Linear warmup duration for new training, measured in epochs")
+    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
+                        help="Warmup initial LR / peak LR, applied separately to allocator and segmenter")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.5,
+                        help="Final cosine LR / peak LR; updated after each optimizer step")
     parser.add_argument("--save_path", default="latest.pth")
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--patch_height", type=int, default=8, help="Latent patch height (default: 8)")
@@ -406,6 +417,12 @@ def run_training() -> None:
         raise ValueError("--temperature must be positive")
     if args.batch <= 0 or args.num_workers < 0 or args.epochs <= 0 or args.log_interval <= 0:
         raise ValueError("batch, epochs and log_interval must be positive; num_workers must be non-negative")
+    if not math.isfinite(args.warmup_epochs) or not 0 <= args.warmup_epochs < args.epochs:
+        raise ValueError("--warmup_epochs must be in [0,epochs)")
+    if not math.isfinite(args.warmup_start_factor) or not 0 <= args.warmup_start_factor <= 1:
+        raise ValueError("--warmup_start_factor must be in [0,1]")
+    if not math.isfinite(args.min_lr_ratio) or not 0 <= args.min_lr_ratio <= 1:
+        raise ValueError("--min_lr_ratio must be in [0,1]")
     if args.snr_db_min > args.snr_db_max:
         raise ValueError("--snr_db_min must not exceed --snr_db_max")
     if not 0 <= args.max_timestep <= 999:
@@ -561,15 +578,13 @@ def run_training() -> None:
         ],
         weight_decay=args.weight_decay,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
+    scheduler = build_training_scheduler(
+        optimizer, args.epochs, len(train_loader), args.warmup_epochs,
+        args.warmup_start_factor, args.min_lr_ratio, checkpoint,
     )
     amp_enabled = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     if checkpoint is not None:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
         if amp_enabled and checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
 
@@ -607,6 +622,8 @@ def run_training() -> None:
             "distributed": distributed,
             "world_size": world_size,
             "global_batch_size": args.batch * world_size,
+            "lr_schedule": training_schedule_config(scheduler),
+            "lr_steps_per_epoch": len(train_loader),
             "input_shape": [
                 CITYSCAPES_INPUT_HEIGHT,
                 CITYSCAPES_INPUT_WIDTH,
@@ -642,6 +659,9 @@ def run_training() -> None:
         device,
         world_size,
     )
+    logger.info("lr_schedule=%s resumed=%s next_lr_allocator=%.8g next_lr_segmenter=%.8g",
+                config["lr_schedule"], checkpoint is not None,
+                optimizer.param_groups[0]["lr"], optimizer.param_groups[1]["lr"])
     logger.info(
         "task=Cityscapes-19 loss=pixel_ce task_model_frozen=false "
         "task_input=received_vae_latent "
@@ -682,6 +702,7 @@ def run_training() -> None:
             len(train_loader),
         )
         for batch_index, (images, labels) in enumerate(train_loader):
+            batch_lrs = [group["lr"] for group in optimizer.param_groups]
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             snr_db = sample_uniform_snr_db(
@@ -716,10 +737,9 @@ def run_training() -> None:
             if not finite_loss.item():
                 raise FloatingPointError("Non-finite training loss")
             scaler.scale(result["loss"]).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(parameters, args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer_updated = optimizer_step_with_schedule(
+                optimizer, scheduler, scaler, parameters, args.grad_clip,
+            )
 
             batch_size = images.shape[0]
             global_step += 1
@@ -744,7 +764,8 @@ def run_training() -> None:
                     "epoch=%d/%d batch=%d/%d loss=%.4f pixel_acc=%.4f "
                     "frame_snr_db=%.2f N0=%.6f mean_symbol_power=%.6f "
                     "frame_energy=%.2f gain_power_min=%.6f "
-                    "gain_power_max=%.6f latent_snr_db=%.2f",
+                    "gain_power_max=%.6f latent_snr_db=%.2f "
+                    "lr_allocator=%.8g lr_segmenter=%.8g optimizer_updated=%s",
                     epoch + 1,
                     args.epochs,
                     batch_index + 1,
@@ -758,6 +779,7 @@ def run_training() -> None:
                     result["group_power"].min().item(),
                     result["group_power"].max().item(),
                     (10.0 * torch.log10(result["snr"])).mean().item(),
+                    batch_lrs[0], batch_lrs[1], optimizer_updated,
                 )
                 if not args.legacy_awgn:
                     logger.info("mean_abs_h=%.6f mean_real_component_power=%.6f gain_floor_infeasible_images=%d",
@@ -831,7 +853,8 @@ def run_training() -> None:
             dist.all_reduce(validation_totals, op=dist.ReduceOp.SUM)
             dist.all_reduce(validation_confusion, op=dist.ReduceOp.SUM)
         validation_samples = int(validation_totals[-1].item())
-        scheduler.step()
+        if not isinstance(scheduler, WarmupCosineLR):
+            scheduler.step()
 
         train_mean = train_totals[:2] / train_samples
         validation_mean = validation_totals[:3] / validation_samples

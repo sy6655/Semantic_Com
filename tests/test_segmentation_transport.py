@@ -315,7 +315,8 @@ class SegmentationTransportTests(unittest.TestCase):
     def test_training_cli_saves_valid_checkpoint_and_resumes_optimizer_and_segmenter(self):
         from train_segmentation_power_allocator import run_training
 
-        loader = torch.utils.data.DataLoader(torch.utils.data.Subset(TinyCityscapes(), [0]), batch_size=1)
+        loader = torch.utils.data.DataLoader(torch.utils.data.Subset(TinyCityscapes(), [0, 1]), batch_size=1)
+        validation_loader = torch.utils.data.DataLoader(torch.utils.data.Subset(TinyCityscapes(), [2]), batch_size=1)
         previous_directory = Path.cwd()
         with tempfile.TemporaryDirectory() as directory:
             try:
@@ -325,31 +326,37 @@ class SegmentationTransportTests(unittest.TestCase):
                 with patch("sys.argv", argv), \
                         patch("train_segmentation_power_allocator.AutoencoderKL.from_pretrained", return_value=TinyVAE()), \
                         patch("train_segmentation_power_allocator.LatentSegFormerB0", side_effect=lambda channels: TinyTask()), \
-                        patch("train_segmentation_power_allocator.construct_cityscapes_dataloaders", return_value=(loader, loader)):
+                        patch("train_segmentation_power_allocator.construct_cityscapes_dataloaders", return_value=(loader, validation_loader)):
                     run_training()
                 checkpoint_path = Path("checkpoints_power/Cityscapes/SegFormer-B0/snr_uniform/smoke/latest.pth")
                 checkpoint = torch.load(checkpoint_path, weights_only=False)
                 self.assertEqual(validate_segmentation_config(checkpoint["config"]), SegmentationLayout())
-                self.assertEqual(checkpoint["global_step"], 1)
+                self.assertEqual(checkpoint["global_step"], 2)
+                self.assertEqual(checkpoint["scheduler"]["last_epoch"], 2)
+                self.assertEqual(checkpoint["scheduler"]["warmup_steps"], 1)
+                self.assertEqual(checkpoint["scheduler"]["total_steps"], 2)
+                self.assertEqual(checkpoint["config"]["lr_schedule"]["interval"], "optimizer_step")
+                self.assertEqual([group["lr"] for group in checkpoint["optimizer"]["param_groups"]], [.0005, .0005])
                 self.assertTrue(checkpoint["optimizer"]["state"])
                 previous_task = checkpoint["segmenter"]["head.weight"].clone()
                 self.close_loggers()
-                # The first run's cosine schedule reached zero LR; use its saved
-                # optimizer state and check step counters as proof of resume.
+                # Resume must preserve the saved LR instead of restarting warmup.
                 argv[argv.index("--epochs") + 1] = "2"
                 argv.extend(["--resume", str(checkpoint_path)])
                 with patch("sys.argv", argv), \
                         patch("train_segmentation_power_allocator.AutoencoderKL.from_pretrained", return_value=TinyVAE()), \
                         patch("train_segmentation_power_allocator.LatentSegFormerB0", side_effect=lambda channels: TinyTask()), \
-                        patch("train_segmentation_power_allocator.construct_cityscapes_dataloaders", return_value=(loader, loader)):
+                        patch("train_segmentation_power_allocator.construct_cityscapes_dataloaders", return_value=(loader, validation_loader)):
                     run_training()
                 resumed = torch.load(checkpoint_path, weights_only=False)
                 self.assertEqual(resumed["epoch"], 1)
-                self.assertEqual(resumed["global_step"], 2)
-                self.assertEqual(resumed["scheduler"]["last_epoch"], 2)
+                self.assertEqual(resumed["global_step"], 4)
+                self.assertEqual(resumed["scheduler"]["last_epoch"], 4)
+                self.assertEqual(resumed["scheduler"]["total_steps"], 2)
+                self.assertEqual([group["lr"] for group in resumed["optimizer"]["param_groups"]], [.0005, .0005])
                 for value in resumed["optimizer"]["state"].values():
-                    self.assertEqual(value["step"].item(), 2)
-                torch.testing.assert_close(resumed["segmenter"]["head.weight"], previous_task, atol=0, rtol=0)
+                    self.assertEqual(value["step"].item(), 4)
+                self.assertFalse(torch.equal(resumed["segmenter"]["head.weight"], previous_task))
             finally:
                 os.chdir(previous_directory)
 

@@ -507,7 +507,7 @@ class PosteriorSamplingTests(unittest.TestCase):
                 self.assertEqual(result["strategies"][strategy]["receiver_mode"], mode)
                 if method == "ddrm":
                     self.assertEqual(result["strategies"][strategy]["diffusion"]["initialization_policy"],
-                                     "clip" if mode == "oracle" else "error")
+                                     "clip")
                 self.assertAlmostEqual(result["strategies"][strategy]["frame_energy"], 256., places=4)
                 self.assertAlmostEqual(result["strategies"][strategy]["mean_real_component_power"], 1., places=5)
                 self.assertAlmostEqual(result["strategies"][strategy]["mean_symbol_power"], 2., places=5)
@@ -535,6 +535,16 @@ class PosteriorSamplingTests(unittest.TestCase):
                     payload["precision"], shared_h.abs().square()[:, None]
                     * payload["estimated_gain"].square() / payload["N0"][:, None],
                 )
+                from visualization_utils import noise_variance_to_diffusion_timestep
+                true_variance = (shared_h.abs().square()[:, None] * payload["group_power"]
+                                 / payload["N0"][:, None]).reciprocal()
+                torch.testing.assert_close(payload["true_timestep"], noise_variance_to_diffusion_timestep(true_variance))
+                torch.testing.assert_close(payload["estimated_timestep"],
+                                           noise_variance_to_diffusion_timestep(payload["precision"].reciprocal()))
+                self.assertEqual(result["strategies"][strategy]["true_timestep"], payload["true_timestep"][0].tolist())
+                self.assertEqual(result["strategies"][strategy]["estimated_timestep"], payload["estimated_timestep"][0].tolist())
+                if mode == "oracle":
+                    torch.testing.assert_close(payload["true_timestep"], payload["estimated_timestep"], rtol=0, atol=0)
                 transmitted = block_map(payload["group_power"].sqrt(),
                                         payload["transformed_latent"], 8, 8) * payload["transformed_latent"]
                 noise = payload["raw_received_latent"] - apply_complex_channel(transmitted, shared_h)
@@ -558,6 +568,7 @@ class PosteriorSamplingTests(unittest.TestCase):
                     torch.testing.assert_close(oracle_payload["equalized_observation"], expected_oracle)
             self.assertTrue((output / "comparison.png").is_file())
             self.assertTrue((output / "reconstructed.png").is_file())
+            self.assertTrue((output / "power_allocation.png").is_file())
 
     def test_uniform_estimator_requires_checkpoint_before_loading_models(self):
         from inference_orthogonal_power import run_inference

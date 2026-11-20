@@ -31,6 +31,7 @@ from train_power_allocator import (
     VAE_SCALE, build_latent_classifier, classifier_forward,
     encode_latents, restore_spatial_latent,
 )
+from visualization_utils import noise_variance_to_diffusion_timestep
 
 
 def oracle_receive(raw_received, group_power, n0, h, rows=8, cols=8):
@@ -79,17 +80,23 @@ def save_image(tensor, path):
     to_pil_image(tensor[0].detach().float().cpu().clamp(0, 1)).save(path)
 
 
-def save_power_allocation(strategies, path, rows=8, cols=8):
-    """Render gain squared and actual energy shares, using shared color scales.
+def save_power_allocation(strategies, path, rows=8, cols=8, *, display="power"):
+    """Render power/energy or real/estimated diffusion timestep maps.
 
     Q-transformed blocks are shown by block ID, not overlaid on RGB patches.
+    The power display remains available for segmentation callers.
     """
+    if display not in ("power", "timestep"):
+        raise ValueError("display must be power or timestep")
+    timestep_display = display == "timestep"
     maps = [
-        (name, torch.as_tensor(data["group_power"]).float().cpu().reshape(rows, cols),
+        (name, torch.as_tensor(data["true_timestep"] if timestep_display else data["group_power"])
+         .float().cpu().reshape(rows, cols),
+         torch.as_tensor(data["estimated_timestep"]).float().cpu().reshape(rows, cols) if timestep_display else
          100 * torch.as_tensor(data["energy_allocation_ratio"]).float().cpu().reshape(rows, cols))
         for name, data in strategies.items()
     ]
-    maxima = [max(float(entry[index].max()) for entry in maps) for index in (1, 2)]
+    maxima = [999., 999.] if timestep_display else [max(float(entry[index].max()) for entry in maps) for index in (1, 2)]
     cell, margin, gap = 72, 24, 40
     grid_width, grid_height = cols * cell, rows * cell
     row_height = grid_height + 120
@@ -109,17 +116,23 @@ def save_power_allocation(strategies, path, rows=8, cols=8):
         low, high = (239, 248, 255), (8, 62, 119)
         return tuple(round(a + fraction * (b - a)) for a, b in zip(low, high))
 
-    draw.text((margin, 12), "Transmit power allocation", font=title_font, fill="black")
-    draw.text((margin, 43), "Common color scale per column; cells show block ID and value.",
+    draw.text((margin, 12), "Diffusion timestep maps" if timestep_display else "Transmit power allocation",
+              font=title_font, fill="black")
+    draw.text((margin, 43), ("Common color scale: 0-999; cells show block ID and timestep." if timestep_display else
+                           "Common color scale per column; cells show block ID and value."),
               font=text_font, fill="black")
     for index, (name, powers, shares) in enumerate(maps):
         top = 80 + index * row_height
         title = ("Allocated + Q: transformed block IDs (row-major)" if name == "allocated"
                  else "Uniform, no Q: spatial blocks (row-major)")
         draw.text((margin, top), title, font=title_font, fill="black")
-        for column, (values, label) in enumerate((
-            (powers, "Gain squared: a_b^2"), (shares, "Share of total transmit energy (%)")
-        )):
+        if timestep_display:
+            estimated_label = ("Estimated diffusion timestep" if strategies[name]["receiver_mode"] == "gain_estimator"
+                               else "Receiver timestep (oracle)")
+            panels = ((powers, "Real diffusion timestep"), (shares, estimated_label))
+        else:
+            panels = ((powers, "Gain squared: a_b^2"), (shares, "Share of total transmit energy (%)"))
+        for column, (values, label) in enumerate(panels):
             left = margin + column * (grid_width + gap)
             draw.text((left, top + 34), label, font=text_font, fill="black")
             grid_top = top + 60
@@ -132,17 +145,18 @@ def save_power_allocation(strategies, path, rows=8, cols=8):
                     x, y = left + col * cell, grid_top + row * cell
                     draw.rectangle((x, y, x + cell - 1, y + cell - 1), fill=rgb, outline="white")
                     draw.text((x + 5, y + 5), f"#{row * cols + col}", font=id_font, fill=foreground)
-                    value_text = f"{value:.2f}%" if column else f"{value:.3g}"
+                    value_text = str(int(value)) if timestep_display else (f"{value:.2f}%" if column else f"{value:.3g}")
                     draw.text((x + 5, y + 30), value_text, font=text_font, fill=foreground)
             bar_top = grid_top + grid_height + 10
             for pixel in range(grid_width):
                 draw.line((left + pixel, bar_top, left + pixel, bar_top + 10),
                           fill=color(pixel / (grid_width - 1)))
             draw.text((left, bar_top + 15), "0", font=id_font, fill="black")
-            maximum_text = f"{maxima[column]:.2f}%" if column else f"{maxima[column]:.3g}"
+            maximum_text = "999" if timestep_display else (f"{maxima[column]:.2f}%" if column else f"{maxima[column]:.3g}")
             draw.text((left + grid_width - 70, bar_top + 15), maximum_text, font=id_font, fill="black")
     draw.text((margin, canvas.height - 28),
-              "Uniform gain is constant; energy shares also depend on the original block energy.",
+              ("SD1.5 timesteps; noise beyond the schedule is displayed as 999." if timestep_display else
+               "Uniform gain is constant; energy shares also depend on the original block energy."),
               font=text_font, fill="black")
     canvas.save(path)
 
@@ -274,6 +288,9 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
             else:
                 received = oracle_receive(raw, power, n0, h)
                 observation = received["observation"]
+            true_precision = h.abs().float().square()[:, None] * power.float() / n0[:, None]
+            true_timestep = noise_variance_to_diffusion_timestep(true_precision.reciprocal())
+            estimated_timestep = noise_variance_to_diffusion_timestep(received["noise_variance"])
             # U_tilde is in the actual transmitter's block coordinates.
             spatial, spatial_info = restore_spatial_latent(
                 observation, {"orthogonal_matrix": observation_q, "group_grid": (8, 8)},
@@ -306,6 +323,8 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
                 "group_power": power[0].cpu().tolist(),
                 "true_amplitude_gain": power[0].sqrt().cpu().tolist(),
                 "estimated_amplitude_gain": received["amplitude_gain"][0].cpu().tolist(),
+                "true_timestep": true_timestep[0].cpu().tolist(),
+                "estimated_timestep": estimated_timestep[0].cpu().tolist(),
                 "precision": received["precision"][0].cpu().tolist(),
                 "equalized_noise_variance": received["noise_variance"][0].cpu().tolist(),
                 "energy_allocation_ratio": (allocated_ratio if uses_q else power * block_energy / budget)[0].cpu().tolist(),
@@ -335,6 +354,7 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
                         "direct_latent": spatial.cpu(), "spatial_received_latent": spatial.cpu(), "restored_latent": restored.cpu(),
                         "group_power": power.cpu(), "estimated_gain": received["amplitude_gain"].cpu(),
                         "precision": received["precision"].cpu(), "N0": n0.cpu(),
+                        "true_timestep": true_timestep.cpu(), "estimated_timestep": estimated_timestep.cpu(),
                         "channel_coefficient": h.cpu(), "channel_gain_abs": h.abs().cpu(),
                         "epsilon": epsilon.cpu()}
             if strategy_receiver_mode == "oracle":
@@ -357,7 +377,7 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
     labels = ["Original"] + [f"{'Allocated + Q' if name == 'allocated' else 'Uniform, no Q'}: {receiver_modes[name]} {method_label}"
                               for name in images]
     _save_labeled_row(panels, labels, output_dir / "comparison.png")
-    save_power_allocation(results, output_dir / "power_allocation.png")
+    save_power_allocation(results, output_dir / "power_allocation.png", display="timestep")
     result = {"checkpoint": str(checkpoint_path), "epoch": int(checkpoint.get("epoch", -1)) + 1,
               "dataset": "ImageNet", "sample_index": args.sample_index, "input_image": args.input_image,
               "image_path": image_path, "label": label,
