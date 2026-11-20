@@ -1,0 +1,93 @@
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/lpips/lpips.py:107: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  self.load_state_dict(torch.load(model_path, map_location='cpu'), strict=False)
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+Loading weights:   0%|          | 0/196 [00:00<?, ?it/s]Loading weights: 100%|██████████| 196/196 [00:00<00:00, 10070.97it/s]
+2026-11-20 16:25:24 INFO epoch=4 phase=val batch=500/782 log_gain_mse=0.017299 relative_mae=0.0996
+2026-11-20 16:28:36 INFO epoch=4 phase=val batch=600/782 log_gain_mse=0.021100 relative_mae=0.1078
+2026-11-20 16:31:48 INFO epoch=4 phase=val batch=700/782 log_gain_mse=0.027661 relative_mae=0.1204
+2026-11-20 16:34:24 INFO epoch=4 metrics={'train': {'log_gain_mse': 0.017793481361615213, 'gain_relative_mae': 94.78671788679652}, 'val': {'log_gain_mse': 0.01726828995168209, 'gain_relative_mae': 0.09740249418735504}} checkpoint=checkpoints_gain_estimator/ImageNet/imagenet_gain_estimator/latest.pth
+2026-11-20 16:34:28 INFO epoch=5 phase=train batch=1/20018 log_gain_mse=0.013526 relative_mae=0.0894
+2026-11-20 16:37:38 INFO epoch=5 phase=train batch=100/20018 log_gain_mse=0.014872 relative_mae=0.0911
+2026-11-20 16:40:51 INFO epoch=5 phase=train batch=200/20018 log_gain_mse=0.015145 relative_mae=0.0936
+2026-11-20 16:44:03 INFO epoch=5 phase=train batch=300/20018 log_gain_mse=0.016662 relative_mae=0.0960
+2026-11-20 16:47:15 INFO epoch=5 phase=train batch=400/20018 log_gain_mse=0.018870 relative_mae=0.0983
+2026-11-20 16:50:27 INFO epoch=5 phase=train batch=500/20018 log_gain_mse=0.015397 relative_mae=0.0881
+2026-11-20 16:53:40 INFO epoch=5 phase=train batch=600/20018 log_gain_mse=0.016198 relative_mae=0.0961
+2026-11-20 16:56:52 INFO epoch=5 phase=train batch=700/20018 log_gain_mse=0.014015 relative_mae=0.0921
+2026-11-20 17:00:04 INFO epoch=5 phase=train batch=800/20018 log_gain_mse=0.016199 relative_mae=0.0968
+2026-11-20 17:03:16 INFO epoch=5 phase=train batch=900/20018 log_gain_mse=0.017317 relative_mae=0.0941
+2026-11-20 17:06:29 INFO epoch=5 phase=train batch=1000/20018 log_gain_mse=0.014515 relative_mae=0.0918
+2026-11-20 17:09:41 INFO epoch=5 phase=train batch=1100/20018 log_gain_mse=0.022157 relative_mae=0.1028
+2026-11-20 17:12:53 INFO epoch=5 phase=train batch=1200/20018 log_gain_mse=0.016309 relative_mae=0.0965
+2026-11-20 17:16:05 INFO epoch=5 phase=train batch=1300/20018 log_gain_mse=0.017628 relative_mae=0.0994
+Traceback (most recent call last):
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 442, in <module>
+    main()
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 438, in main
+    run(parse_arguments())
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 230, in run
+    return evaluate(args, device)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 343, in evaluate
+    restored, h, fallback = restore_transmissions(latent, snr, allocator, channel, sampler,
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 174, in restore_transmissions
+    restored[name] = strategy_sampler(observation, received["precision"], matrix,
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/Semantic_Com/ddrm_sampling.py", line 72, in __call__
+    raise ValueError(
+ValueError: DDRM initialization requires sigma_T^2 >= 1/lambda_b; 11 image/block entries violate this condition (sigma_T=14.6146, max observation std=22.9318). No noise clipping or transmitter changes were applied.
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/lpips/lpips.py:107: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  self.load_state_dict(torch.load(model_path, map_location='cpu'), strict=False)
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+Loading weights:   0%|          | 0/196 [00:00<?, ?it/s]Loading weights: 100%|██████████| 196/196 [00:00<00:00, 9491.79it/s]
+Traceback (most recent call last):
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 442, in <module>
+    main()
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 438, in main
+    run(parse_arguments())
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 230, in run
+    return evaluate(args, device)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 343, in evaluate
+    restored, h, fallback = restore_transmissions(latent, snr, allocator, channel, sampler,
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/Semantic_Com/evaluate_power_maxvit.py", line 174, in restore_transmissions
+    restored[name] = strategy_sampler(observation, received["precision"], matrix,
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bsy/Semantic_Com/ddrm_sampling.py", line 72, in __call__
+    raise ValueError(
+ValueError: DDRM initialization requires sigma_T^2 >= 1/lambda_b; 5 image/block entries violate this condition (sigma_T=14.6146, max observation std=23.1572). No noise clipping or transmitter changes were applied.
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/lpips/lpips.py:107: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  self.load_state_dict(torch.load(model_path, map_location='cpu'), strict=False)
+/home/bsy/miniconda3/envs/semantic/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+Loading weights:   0%|          | 0/196 [00:00<?, ?it/s]Loading weights: 100%|██████████| 196/196 [00:00<00:00, 10911.36it/s]
+2026-11-20 17:19:17 INFO epoch=5 phase=train batch=1400/20018 log_gain_mse=0.016911 relative_mae=0.0964
+2026-11-20 17:22:29 INFO epoch=5 phase=train batch=1500/20018 log_gain_mse=0.017517 relative_mae=0.0943
+2026-11-20 17:25:42 INFO epoch=5 phase=train batch=1600/20018 log_gain_mse=0.020067 relative_mae=0.1009
+2026-11-20 17:28:54 INFO epoch=5 phase=train batch=1700/20018 log_gain_mse=0.017306 relative_mae=0.0931
+2026-11-20 17:32:06 INFO epoch=5 phase=train batch=1800/20018 log_gain_mse=0.016311 relative_mae=0.0979
+2026-11-20 17:35:18 INFO epoch=5 phase=train batch=1900/20018 log_gain_mse=0.013673 relative_mae=0.0883
+2026-11-20 17:38:30 INFO epoch=5 phase=train batch=2000/20018 log_gain_mse=0.018458 relative_mae=0.0967
+2026-11-20 17:41:42 INFO epoch=5 phase=train batch=2100/20018 log_gain_mse=0.016377 relative_mae=0.0972

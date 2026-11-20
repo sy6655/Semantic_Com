@@ -1,0 +1,14 @@
+*.pyc
+*.pt
+checkpoints/*
+checkpoints_gain_estimator/*
+checkpoints_power/*
+checkpoints_timestep_estimator/*
+codex
+*/__pycache__/*
+result/*
+results/*
+**/checkpoints/
+multimodal/*
+oracle_results/*
+

@@ -1,0 +1,99 @@
+평가 checkpoint: /home/bsy/Semantic_Com/checkpoints_power/ImageNet/snr_-5.0-0.0-5.0-10.0-15.0-20.0/imagenet_1106_amp/latest.pth
+수신 모드: uniform=oracle, allocated=gain_estimator
+Gain estimator checkpoint: /home/bsy/Semantic_Com/checkpoints_gain_estimator/ImageNet/imagenet_gain_estimator/latest.pth
+송신 gain 하한에 max_timestep=999 기준을 적용합니다.
+클래스 균등 추출: 1000개 클래스, 클래스당 5~5장, seed=42입니다.
+ImageNet 5000장, VAE / uniform(no Q)+DDRM / allocated(Q)+DDRM
+SNR=10 dB, 16/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=10 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                93.750      100.000       28.567      0.16928
+uniform            81.250       93.750       24.823      0.32545
+allocated          87.500       93.750       24.219      0.30433
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=10 dB, 160/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=10 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                91.250       98.125       28.245      0.15656
+uniform            82.500       91.875       24.305      0.31836
+allocated          87.500       95.625       23.572      0.29936
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=10 dB, 320/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=10 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                87.500       96.875       26.985      0.17218
+uniform            79.062       90.625       23.542      0.33117
+allocated          80.938       93.125       22.946      0.31523
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=10 dB, 480/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=10 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                88.333       97.292       27.094      0.16996
+uniform            79.583       91.042       23.668      0.32444
+allocated          81.875       93.125       23.069      0.30919
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=10 dB, 640/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=10 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                89.062       97.812       27.012      0.17327
+uniform            80.312       90.938       23.542      0.33053
+allocated          82.344       93.281       22.939      0.31536
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=10 dB, 800/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=10 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                90.125       98.000       27.007      0.17171
+uniform            82.500       91.750       23.584      0.32516
+allocated          84.000       94.000       22.964      0.31105
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+평가 checkpoint: /home/bsy/Semantic_Com/checkpoints_power/ImageNet/snr_-5.0-0.0-5.0-10.0-15.0-20.0/imagenet_1106_amp/latest.pth
+수신 모드: uniform=oracle, allocated=gain_estimator
+Gain estimator checkpoint: /home/bsy/Semantic_Com/checkpoints_gain_estimator/ImageNet/imagenet_gain_estimator/latest.pth
+송신 gain 하한에 max_timestep=999 기준을 적용합니다.
+클래스 균등 추출: 1000개 클래스, 클래스당 5~5장, seed=42입니다.
+ImageNet 5000장, VAE / uniform(no Q)+DDRM / allocated(Q)+DDRM
+평가 checkpoint: /home/bsy/Semantic_Com/checkpoints_power/ImageNet/snr_-5.0-0.0-5.0-10.0-15.0-20.0/imagenet_1106_amp/latest.pth
+수신 모드: uniform=oracle, allocated=gain_estimator
+Gain estimator checkpoint: /home/bsy/Semantic_Com/checkpoints_gain_estimator/ImageNet/imagenet_gain_estimator/latest.pth
+송신 gain 하한에 max_timestep=999 기준을 적용합니다.
+클래스 균등 추출: 1000개 클래스, 클래스당 5~5장, seed=42입니다.
+ImageNet 5000장, VAE / uniform(no Q)+DDRM / allocated(Q)+DDRM
+SNR=20 dB, 16/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=20 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                93.750      100.000       28.567      0.16928
+uniform            87.500       93.750       26.662      0.24871
+allocated          87.500      100.000       24.482      0.25170
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=20 dB, 160/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=20 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                91.250       98.125       28.245      0.15656
+uniform            92.500       98.125       26.397      0.22681
+allocated          91.250       98.750       24.354      0.23045
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
+SNR=20 dB, 320/5000장 완료
+
+[중간 누적] Rayleigh / perfect CSI / SNR=20 dB
+strategy        Top-1 (%)    Top-5 (%)    PSNR (dB)        LPIPS
+vae                87.500       96.875       26.985      0.17218
+uniform            87.188       96.875       25.359      0.24001
+allocated          86.562       96.875       23.674      0.24471
+timestep 하한 전력 부족으로 균일 gain 적용: 0장
+DDRM 초기화 추가 noise=0 적용 누적: uniform 0장/0블록, allocated 0장/0블록
