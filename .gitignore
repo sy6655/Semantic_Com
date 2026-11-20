@@ -11,4 +11,6 @@ results/*
 **/checkpoints/
 multimodal/*
 oracle_results/*
-
+sbatch.err
+sbatch.out
+logs/*
