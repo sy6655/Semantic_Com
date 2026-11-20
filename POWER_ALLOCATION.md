@@ -302,7 +302,7 @@ DDRM에서는 `--max_timestep`을 생략하면 **999**가 적용됩니다. 기�
 
 논문 Eq. (7)의 초기화에는 `sigma_T^2 >= 1/lambda_b`가 필요합니다.
 현재 구현은 양의 finite precision을 사용하는 full-rank 수신기입니다.
-**Oracle 수신에서는** deep fading 등으로 위 조건을 넘는 블록도 timestep 999에서
+**Oracle과 gain estimator 수신 모두** 위 조건을 넘는 블록도 timestep 999에서
 계속 복원합니다. 초기화에 추가하는 잡음 분산만 아래처럼 0으로 제한합니다.
 
 ```text
@@ -310,19 +310,21 @@ initial_variance_b = max(sigma_T^2 - 1/lambda_b, 0)
 W_T,b = U_tilde_b + sqrt(initial_variance_b) * Xi_b
 ```
 
-초과 블록은 `W_T,b=U_tilde_b`로 시작합니다. 관측값과 실제 precision은 그대로
+초과 블록은 `W_T,b=U_tilde_b`로 시작합니다. 관측값과 수신기에 전달된 precision은 그대로
 유지하고, 이후 Eq. (8)에서는 원래 `lambda_b`를 사용합니다. 이 처리는 초기
 분포가 timestep 999와 정확히 일치하지 않는 실험용 근사입니다. Gain estimator
-수신에서는 기존처럼 초기화 조건을 검사하고 위반 시 오류로 중단합니다.
+수신에서도 추정 gain과 추정 precision은 수정하지 않습니다. 모델이 log-gain을
+출력하므로 이를 noise로 환산한 값은 timestep 999의 최대 noise를 넘을 수 있습니다.
 DDRM의 기본 `max_timestep=999` 송신 gain 하한도 유지하지만 전력 예산이 부족한
 경우에는 위 초기화 근사로 진행합니다. Uniform/no-Q와 allocated/Q에 동일한
-oracle 초기화 정책을 적용하며 이미지를 건너뛰지 않습니다.
+초기화 정책을 적용하며 이미지를 건너뛰지 않습니다. 공통 sampler 구성을 사용하므로
+inference와 MaxViT eval에 동일하게 적용됩니다.
 
 oracle 실행은 `*_oracle_ddrm.png`, `ddrm_vs_input`, `ddrm_latent_mse`를 저장하고,
 `result.json`의 `restoration_method`와 `diffusion`에 실제 방식 및 초기화 설정,
 단계별 sigma, Case A/B 블록 수와 관측 손실을 기록합니다. 기본 저장 경로도
 DDRM 및 eta/eta_B 값을 포함하므로 DPS 결과와 구분됩니다.
-`diffusion.initialization_policy`는 oracle에서 `clip`, 추정 gain에서는 `error`입니다.
+`diffusion.initialization_policy`는 oracle과 추정 gain 모두 `clip`입니다.
 `initialization_clipped_blocks`는 이미지별 초과 블록 수이며,
 `initialization_clipped_images`와 `initialization_clipped_block_count`도 기록합니다.
 
@@ -418,8 +420,8 @@ Allocated 수신에 gain estimator를 사용하시려면 기존 명령에
 추가하시면 됩니다. Uniform은 oracle을 유지합니다. Estimator는 실제 제공된 Q와
 allocator를 사용하며, 학습 당시 allocator fingerprint와 다르더라도 차단하지 않습니다.
 Allocated 복원에는 추정 gain으로 equalize한 관측과 추정 precision을 사용합니다.
-DDRM 초기화 정책은 uniform에서 기존 `clip`, 추정 gain에서 기존 inference와 같은
-`error`를 사용합니다. 기본 결과 파일에는 `_receiver_gain_estimator_uniform_oracle`을
+DDRM 초기화 정책은 uniform과 allocated 모두 `clip`을 사용하며,
+초과 블록 수를 전략별로 기록합니다. 기본 결과 파일에는 `_receiver_gain_estimator_uniform_oracle`을
 붙여 oracle 결과와 구분하고, JSON에 수신 모드와 estimator 경로/설정을 기록합니다.
 
 정확도는 사전학습 RGB MaxViT-Large와 공통 `power_utils.maxvit_input`의

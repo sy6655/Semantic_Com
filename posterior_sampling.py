@@ -36,7 +36,8 @@ def build_restoration_sampler(reverse_model, args, receiver_mode=None):
         receiver_mode = receiver_mode or getattr(args, "receiver_mode", None)
         return OrthogonalDDRM(reverse_model, getattr(args, "ddrm_eta", 0.85),
                               getattr(args, "ddrm_eta_b", 1.0),
-                              initialization_policy="clip" if receiver_mode == "oracle" else "error")
+                              initialization_policy=("clip" if receiver_mode in ("oracle", "gain_estimator")
+                                                     else "error"))
     if method != "dps":
         raise ValueError(f"Unknown restoration_method: {method}")
     return OrthogonalPosteriorSampling(reverse_model, args.guidance_scale,

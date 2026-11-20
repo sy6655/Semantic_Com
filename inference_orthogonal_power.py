@@ -283,8 +283,13 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
             if classifier is not None:
                 direct_task = _task_result(classifier_forward(classifier, spatial, spatial_info, condition_on_snr), label)
             diffusion_generator.set_state(diffusion_state)
-            restored = sampler(observation, received["precision"], observation_q, diffusion_generator,
-                               verbose=not getattr(args, "quiet", False))
+            try:
+                restored = sampler(observation, received["precision"], observation_q, diffusion_generator,
+                                   verbose=not getattr(args, "quiet", False))
+            except ValueError as error:
+                policy = getattr(sampler, "initialization_policy", None)
+                raise ValueError(f"Restoration failed: strategy={name}, receiver_mode={strategy_receiver_mode}, "
+                                 f"initialization_policy={policy}: {error}") from error
             if classifier is not None:
                 restored_task = _task_result(classifier_forward(classifier, restored, spatial_info, condition_on_snr), label)
             direct_images[name] = _decode_latent(vae, spatial, vae_scale)

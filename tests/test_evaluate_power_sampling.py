@@ -128,8 +128,7 @@ class BalancedEvaluationTests(unittest.TestCase):
                 self.assertIs(unused_kwargs["gain_estimator"], estimator)
                 if method == "ddrm":
                     self.assertEqual(unused_kwargs["uniform_sampler"].initialization_policy, "clip")
-                    self.assertEqual(unused_args[3].initialization_policy,
-                                     "error" if receiver_mode == "gain_estimator" else "clip")
+                    self.assertEqual(unused_args[3].initialization_policy, "clip")
                 received_indices.extend(latent[:, 0, 0, 0].to(dtype=torch.long).tolist())
                 batch = latent.shape[0]
                 if method == "ddrm":
@@ -170,7 +169,7 @@ class BalancedEvaluationTests(unittest.TestCase):
             self.assertEqual(result["strategy_receiver_modes"], {"uniform": "oracle", "allocated": receiver_mode})
             if method == "ddrm":
                 self.assertEqual(result["ddrm_initialization_policies"],
-                                 {"uniform": "clip", "allocated": "error" if receiver_mode == "gain_estimator" else "clip"})
+                                 {"uniform": "clip", "allocated": "clip"})
             for image_ids in seen:
                 self.assertEqual(image_ids, expected * 2)
             self.assertEqual(received_indices, expected * 2)

@@ -16,9 +16,10 @@ class OrthogonalDDRM:
     """Use the frozen SD prior in spatial VP coordinates and sample in Q space.
 
     This full-rank receiver requires positive finite precision. By default,
-    sigma_T^2 >= 1/lambda_b is required for every image/block. Oracle callers
-    may use initialization_policy="clip": excess-noise blocks start from the
-    observation with zero added noise, retaining their true precision in Eq. 8.
+    sigma_T^2 >= 1/lambda_b is required for every image/block. Oracle and gain
+    estimator callers use initialization_policy="clip": excess-noise blocks
+    start from the observation with zero added noise, retaining the supplied
+    precision in Eq. 8. This initialization is an approximation above sigma_T.
     """
 
     def __init__(self, reverse_model, eta=0.85, eta_b=1.0, initialization_policy="error"):
@@ -84,14 +85,14 @@ class OrthogonalDDRM:
                 return torch.randn(blocks.shape, device=observed.device,
                                    dtype=torch.float32, generator=generator)
 
-            # Eq. 7 for supported blocks. Oracle approximation for excess
+            # Eq. 7 for supported blocks. Initialization approximation for excess
             # noise: W_T,b=U_tilde_b (zero added noise). Do not clamp weights
-            # or variance: the reverse updates still use the true precision.
+            # or variance: reverse updates still use the supplied precision.
             spectral = blocks + (sigmas_squared[0] - variance).clamp_min(0).sqrt()[..., None] * noise()
             current = alphas[0].sqrt() * unpatchify(matrix @ spectral, observed.shape, rows, cols)
             if verbose and clipped_block_count:
-                print(f"DDRM oracle initialization: zero added noise for {clipped_block_count} blocks "
-                      f"in {clipped_images} images; actual precision retained", flush=True)
+                print(f"DDRM initialization: zero added noise for {clipped_block_count} blocks "
+                      f"in {clipped_images} images; supplied precision retained", flush=True)
             prompt = self.model._empty_prompt_embedding(observed.shape[0])
             history = []
             for index, timestep in enumerate(schedule):

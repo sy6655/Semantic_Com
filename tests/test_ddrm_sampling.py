@@ -242,10 +242,10 @@ class DDRMSamplingTests(unittest.TestCase):
         self.assertEqual((sampler.eta, sampler.eta_b), (.85, 1.))
         self.assertEqual(sampler.initialization_policy, "error")
         args.receiver_mode = "gain_estimator"
-        self.assertEqual(build_restoration_sampler(None, args).initialization_policy, "error")
+        self.assertEqual(build_restoration_sampler(None, args).initialization_policy, "clip")
         args.receiver_mode = "oracle"
         self.assertEqual(build_restoration_sampler(None, args).initialization_policy, "clip")
-        self.assertEqual(build_restoration_sampler(None, args, receiver_mode="gain_estimator").initialization_policy, "error")
+        self.assertEqual(build_restoration_sampler(None, args, receiver_mode="gain_estimator").initialization_policy, "clip")
         args.receiver_mode = None
         self.assertEqual(build_restoration_sampler(None, args, receiver_mode="oracle").initialization_policy, "clip")
 
@@ -255,7 +255,13 @@ class DDRMSamplingTests(unittest.TestCase):
     def test_oracle_inference_continues_through_deep_fading_for_both_strategies(self):
         self.check_oracle_inference_outputs(deep_fading=True)
 
-    def check_oracle_inference_outputs(self, deep_fading):
+    def test_gain_estimator_inference_continues_with_five_blocks_above_maximum_noise(self):
+        self.check_oracle_inference_outputs(deep_fading=False, estimated_gain=True)
+
+    def test_gain_estimator_inference_also_handles_uniform_deep_fading(self):
+        self.check_oracle_inference_outputs(deep_fading=True, estimated_gain=True)
+
+    def check_oracle_inference_outputs(self, deep_fading, estimated_gain=False):
         from inference_oracle_gain import run
         from train_power_allocator import PowerAllocator
 
@@ -288,6 +294,12 @@ class DDRMSamplingTests(unittest.TestCase):
             sample_channel_coefficient=lambda latent, generator: torch.tensor([.001+0j if deep_fading else 1.+0j]),
             _noise_spectral_density=lambda latent, snr: torch.tensor([.1]),
         )
+        desired_std = torch.full((1, 64), 2.)
+        desired_std[:, :5] = 23.1572
+
+        def estimator(equalized, log_noise, log_power):
+            return .5 * log_noise[:, None] - desired_std.log()
+
         with tempfile.TemporaryDirectory() as directory:
             checkpoint_path = Path(directory) / "latest.pth"
             torch.save({"allocator": allocator.state_dict(), "config": config, "epoch": 0}, checkpoint_path)
@@ -298,11 +310,14 @@ class DDRMSamplingTests(unittest.TestCase):
                 output_dir=directory, diffusion_steps=2, diffusion_model=None, strategy="both",
                 restoration_method="ddrm", ddrm_eta=.85, ddrm_eta_b=1.,
                 quiet=True, lpips=False, no_save_latents=False,
+                receiver_mode="gain_estimator" if estimated_gain else "oracle",
+                gain_estimator_checkpoint=str(Path(directory) / "gain.pth") if estimated_gain else None,
             )
             with patch("inference_orthogonal_power.load_transmitter", return_value=(allocator, channel, config, checkpoint_path)), \
                     patch("inference_orthogonal_power.load_input", return_value=(torch.rand(1, 3, 64, 64), 0, "test.png")), \
                     patch("inference_orthogonal_power.AutoencoderKL.from_pretrained", return_value=TinyVAE()), \
                     patch("inference_orthogonal_power.encode_latents", return_value=latent), \
+                    patch("inference_orthogonal_power.load_gain_estimator", return_value=(estimator, {})), \
                     patch("inference_orthogonal_power.allocate_power_for_inference", return_value=(powers * energy / budget, powers, info)), \
                     patch("inference_orthogonal_power.StaggeredReverseDiffusion", return_value=self.backend()):
                 result = run(args)
@@ -316,16 +331,32 @@ class DDRMSamplingTests(unittest.TestCase):
                 self.assertNotIn("dps_vs_input", strategy)
                 self.assertEqual(strategy["diffusion"]["method"], "ddrm")
                 self.assertEqual(strategy["diffusion"]["initialization_policy"], "clip")
-                self.assertEqual(strategy["diffusion"]["initialization_clipped_block_count"], 64 if deep_fading else 0)
-                self.assertTrue((Path(directory) / f"{tag}_oracle_ddrm.png").is_file())
-                state = torch.load(Path(directory) / f"{tag}_oracle_state.pt", weights_only=True)
+                is_estimated = name == "allocated" and estimated_gain
+                expected_clips = 5 if is_estimated else (64 if deep_fading else 0)
+                self.assertEqual(strategy["diffusion"]["initialization_clipped_block_count"], expected_clips)
+                self.assertEqual(strategy["receiver_mode"], "gain_estimator" if is_estimated else "oracle")
+                if not is_estimated:
+                    self.assertTrue((Path(directory) / f"{tag}_oracle_ddrm.png").is_file())
+                state = torch.load(Path(directory) / f"{name}_baseband.pt", weights_only=True)
                 self.assertTrue(torch.isfinite(state["restored_latent"]).all())
+                if is_estimated:
+                    torch.testing.assert_close(state["precision"].reciprocal().sqrt(), desired_std)
+                    self.assertAlmostEqual(strategy["diffusion"]["max_observation_std"], 23.1572, places=4)
                 if name == "uniform":
                     torch.testing.assert_close(state["Q"], torch.eye(64))
-                if deep_fading:
+                if deep_fading and not is_estimated:
                     self.assertTrue((state["precision"].reciprocal() > strategy["diffusion"]["initial_sigma"]**2).all())
 
     def test_maxvit_ddrm_transmission_path_and_result_filename(self):
+        self.check_maxvit_ddrm_transmissions()
+
+    def test_maxvit_estimated_gain_continues_with_reported_five_block_overflow(self):
+        self.check_maxvit_ddrm_transmissions(estimated_gain=True)
+
+    def test_maxvit_both_uniform_and_estimated_gain_continue_above_maximum_noise(self):
+        self.check_maxvit_ddrm_transmissions(estimated_gain=True, deep_fading=True)
+
+    def check_maxvit_ddrm_transmissions(self, estimated_gain=False, deep_fading=False):
         from evaluate_power_maxvit import evaluation_output_path, restore_transmissions
 
         latent = torch.randn(2, 4, 8, 8) * .2
@@ -337,18 +368,27 @@ class DDRMSamplingTests(unittest.TestCase):
         budget = 25. * patchify(latent).square().sum(-1).sum(1, keepdim=True)
         info = {"channel_input": transformed, "orthogonal_matrix": q,
                 "target_frame_energy": budget}
-        h = torch.tensor([1.+.2j, .8-.3j])
+        h = torch.tensor([1.+.2j, .001+0j if deep_fading else .8-.3j])
         channel = SimpleNamespace(
             sample_channel_coefficient=lambda latent, generator: h,
             _noise_spectral_density=lambda latent, snr: torch.full((2,), .1),
         )
-        sampler = build_restoration_sampler(self.backend(), SimpleNamespace(restoration_method="ddrm"), receiver_mode="oracle")
+        mode = "gain_estimator" if estimated_gain else "oracle"
+        sampler = build_restoration_sampler(self.backend(), SimpleNamespace(restoration_method="ddrm"), receiver_mode=mode)
+        uniform_sampler = build_restoration_sampler(self.backend(), SimpleNamespace(restoration_method="ddrm"), receiver_mode="oracle")
+        desired_std = torch.full((2, 64), 2.)
+        desired_std[0, :5] = 23.1572
+
+        def estimator(equalized, log_noise, log_power):
+            return .5 * log_noise[:, None] - desired_std.log()
+
         diagnostics = {}
         with patch("evaluate_power_maxvit.allocate_power_for_inference", return_value=(None, powers, info)):
             restored, actual_h, fallback = restore_transmissions(
                 latent, torch.full((2,), 10.), None, channel, sampler,
                 torch.Generator().manual_seed(1), torch.Generator().manual_seed(2),
-                diagnostics=diagnostics,
+                diagnostics=diagnostics, receiver_mode=mode,
+                gain_estimator=estimator if estimated_gain else None, uniform_sampler=uniform_sampler,
             )
         self.assertEqual(set(restored), {"uniform", "allocated"})
         for value in restored.values():
@@ -359,6 +399,11 @@ class DDRMSamplingTests(unittest.TestCase):
         self.assertEqual(set(diagnostics), {"uniform", "allocated"})
         for row in diagnostics.values():
             self.assertEqual(row["initialization_policy"], "clip")
+        self.assertEqual(diagnostics["uniform"]["initialization_clipped_block_count"], 64 if deep_fading else 0)
+        self.assertEqual(diagnostics["allocated"]["initialization_clipped_block_count"], 5 if estimated_gain else 0)
+        if estimated_gain:
+            self.assertAlmostEqual(diagnostics["allocated"]["max_observation_std"], 23.1572, places=4)
+            self.assertEqual(diagnostics["allocated"]["initialization_clipped_blocks"], [5, 0])
         args = SimpleNamespace(output_path=None, snr_db=[10.], restoration_method="ddrm",
                                diffusion_steps=2, ddrm_eta=.85, ddrm_eta_b=1., seed=0)
         path = evaluation_output_path(args, Path("/tmp/checkpoint/latest.pth"), 10.)

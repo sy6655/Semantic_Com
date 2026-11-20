@@ -171,8 +171,14 @@ def restore_transmissions(latent, snr, allocator, channel, sampler,
                 observation = received["observation"]
         strategy_sampler = uniform_sampler if name == "uniform" and uniform_sampler is not None else sampler
         diffusion_generator.set_state(diffusion_state)
-        restored[name] = strategy_sampler(observation, received["precision"], matrix,
-                                          diffusion_generator, verbose=False)
+        try:
+            restored[name] = strategy_sampler(observation, received["precision"], matrix,
+                                              diffusion_generator, verbose=False)
+        except ValueError as error:
+            mode = "oracle" if name == "uniform" else receiver_mode
+            policy = getattr(strategy_sampler, "initialization_policy", None)
+            raise ValueError(f"Restoration failed: strategy={name}, receiver_mode={mode}, "
+                             f"initialization_policy={policy}: {error}") from error
         if diagnostics is not None:
             diagnostics[name] = strategy_sampler.last_diagnostics
     fallback = info.get("gain_floor_fallback", torch.zeros_like(h.real, dtype=torch.bool))
