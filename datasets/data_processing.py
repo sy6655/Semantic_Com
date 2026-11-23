@@ -192,6 +192,7 @@ def construct_dataloaders(
     image_size=256,
     distributed=False,
     seed=0,
+    num_workers=None,
 ):
     path = os.path.expanduser(data_path)
 
@@ -227,7 +228,7 @@ def construct_dataloaders(
         if distributed
         else None
     )
-    num_workers = min(torch.get_num_threads(), 4)
+    num_workers = min(torch.get_num_threads(), 4) if num_workers is None else num_workers
     trainloader = torch.utils.data.DataLoader(
         trainset,
         batch_size=min(batch_size, len(trainset)),

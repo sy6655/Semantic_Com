@@ -169,7 +169,9 @@ torchrun --standalone --nproc_per_node=2 train_gain_estimator.py \
 
 ## 3. Gain 보정 관측값을 이용한 diffusion posterior sampling
 
-Classification Q inference는 **`inference_orthogonal_power.py`**로 통합했습니다.
+ImageNet과 Cityscapes의 Q inference는 **`inference_orthogonal_power.py`**의
+단일 실행 코드로 통합했습니다. `inference_segmentation_power.py`도 같은 코드를
+호출하며 데이터 로딩과 블록 격자만 checkpoint에 맞게 선택합니다.
 Oracle과 gain estimator가 같은 송신·복원 경로를 사용하며 기본값은
 **AWGN(`h=1`), DDRM, uniform의 `Q=I`**입니다. Allocated는 지정한
 checkpoint의 학습 Q와 allocator를 그대로 사용합니다. Checkpoint를 한 번
@@ -671,10 +673,19 @@ SD1.5 UNet 호출 사이를 Q로 변환합니다. 기존 DPS도
 적용하여 pixel accuracy와 mIoU를 계산합니다. 학습한 latent SegFormer는
 이 최종 평가에 사용하지 않습니다.
 
+단일 이미지 추론은 분류와 동일한 `inference_orthogonal_power.run_inference`를
+사용합니다. SegFormer를 추가로 로드하거나 단일 이미지의 segmentation 정확도를
+계산하지 않습니다. 분류와 같은 PSNR·선택적 LPIPS, 단계별 DDRM/DPS 로그,
+수신 모드, timestep 맵과 결과 파일 형식을 사용합니다. VAE·모델 로딩 단계도
+콘솔에 표시하고 결과 JSON에는 전체 및 전략별 경과 시간을 기록합니다.
+ImageNet 기본 채널은 AWGN, Cityscapes 기본 채널은 Rayleigh이며
+`--channel_model awgn`은 segmentation도 `h=1`로 실행합니다.
+
 Uniform은 Q 없이 공간 latent에 공통 gain을 적용합니다. Allocated는 학습한
 Q와 블록별 gain을 사용합니다. 두 방식의 전력 예산은 같고, **같은 이미지·VAE
 posterior sample·h·채널 잡음·diffusion 난수**로 비교합니다.
-`uncompressed`는 채널을 거치지 않은 VAE encode/decode 기준선입니다.
+최종 평가의 `vae`는 채널을 거치지 않은 VAE encode/decode 기준선입니다.
+기존 `--strategy uncompressed`도 `--strategy vae`의 별칭으로 사용할 수 있습니다.
 
 새 실험 학습과 최종 평가는 다음과 같이 실행하실 수 있습니다.
 
@@ -686,22 +697,99 @@ python train_segmentation_power_allocator.py \
 
 python eval_segmentation_power_allocator.py \
   --checkpoint checkpoints_power/Cityscapes/SegFormer-B0/snr_uniform/cityscapes_q512_rayleigh/latest.pth \
-  --data_path /data/bsy --snr_db 0 --batch 1 --amp \
-  --restoration_method ddrm --diffusion_steps 25
+  --gain_estimator_checkpoint checkpoints_gain_estimator/Cityscapes/cityscapes_q512_gain_estimator/latest.pth \
+  --channel_model awgn --snr_db -3 0 5 10 15 \
+  --receiver_mode gain_estimator --uniform_receiver_mode oracle \
+  --amp --seed 42
 ```
 
-기본 평가는 Cityscapes val 전체입니다. 짧게 확인하시려면 `--max_samples 10`을
-추가하시면 됩니다. `--strategy all`이 기본이며 uniform/allocated/uncompressed를
-모두 평가합니다. 단일 이미지 복원과 배정 시각화는 다음과 같습니다.
+기본 평가는 Cityscapes val 전체이며, `--strategy all`로
+VAE/uniform/allocated를 비교합니다. 복원 RGB를 pretrained Mask2Former에 전달하여
+pixel accuracy와 mIoU를 계산하고, 원본 RGB 대비 PSNR·LPIPS도 함께 기록합니다.
+19×19 confusion matrix와 클래스별 IoU도 JSON에 저장합니다. `--batch_size`의
+기본값은 1이며 기존 `--batch`도 지원합니다. `--amp`는 diffusion 모델에 적용하고
+VAE·Mask2Former·품질 지표는 float32로 계산합니다.
+
+`--snr_db`에 여러 값을 주실 수 있습니다. `--channel_model awgn`은 `h=1`,
+`rayleigh`는 이미지별 공통 `h~CN(0,1)`입니다. Allocated 수신 모드는 estimator
+경로가 있으면 자동으로 gain estimator, 없으면 oracle입니다. Uniform은 기본
+oracle이며, 명시적인 `--uniform_receiver_mode`로 바꿀 수 있습니다. Estimator의
+학습 시점 Q와 현재 checkpoint의 Q가 달라도 실행하며, 일치 여부만 기록합니다.
+DDRM 최대 noise를 넘는 블록은 두 수신 모드 모두 초기 추가 잡음만 0으로 두고
+원래 precision을 유지합니다. 초과 블록/이미지 수와 전력 하한 fallback 수도 기록합니다.
+
+짧게 확인하시려면 `--max_samples 10`을 추가하시면 됩니다. Subset은 seed로
+중복 없이 한 번 선택하고, 전체 SNR과 모든 전략에 같은 이미지와 VAE latent를
+사용합니다. 채널과 diffusion 난수도 SNR/전략 사이에 동일하게 재생합니다.
+한 segmentation 이미지에는 여러 클래스가 포함되므로 ImageNet처럼 클래스별
+이미지 수를 균등하게 할당하지 않습니다.
+
+결과는 checkpoint 폴더의 `evaluation/mask2former_*.json`과 같은 이름의 `.log`에
+SNR별로 저장합니다. 파일명에 채널·SNR·복원 설정·seed·표본 수·수신 모드를
+포함하여 oracle/estimator 결과를 구분합니다. 중간 누적 지표도 저장하며 완료
+여부는 `complete`로 확인합니다. `--output_path results/eval.json`을 지정하면
+여러 SNR에서는 `eval_snr_-3.json`, `eval_snr_0.json` 등으로 저장합니다.
+`--strategy both`는 uniform/allocated만, `allocated`·`uniform`·`vae`는 해당 경로만
+평가합니다. `--no-lpips`로 LPIPS를 생략하셔도 PSNR은 항상 계산합니다.
+
+단일 이미지 복원과 배정 시각화는 다음과 같습니다.
 
 ```bash
 python inference_segmentation_power.py \
   --checkpoint checkpoints_power/Cityscapes/SegFormer-B0/snr_uniform/cityscapes_q512_rayleigh/latest.pth \
-  --sample_index 0 --snr_db 0 --amp
+  --sample_index 0 --snr_db 0 --amp \
+  --receiver_mode oracle --restoration_method ddrm --diffusion_steps 25
 
 python visualize_segmentation_power.py \
   --checkpoint checkpoints_power/Cityscapes/SegFormer-B0/snr_uniform/cityscapes_q512_rayleigh/latest.pth \
   --sample_index 0 --snr_db 0
+```
+
+단일 이미지 추론에서 `--strategy both`는 uniform과 allocated를 함께 복원합니다.
+`--strategy allocated` 또는 `uniform`은 해당 전략만 실행합니다. `--quiet`은 로딩/
+diffusion 진행 로그를 줄이고, `--no-lpips`는 LPIPS를 생략하며, `--no_save_latents`는
+baseband/state tensor 저장을 생략합니다. `--input_image <path>`로 별도 RGB를
+입력하면 Cityscapes와 같은 1024×2048로 resize합니다. 같은 checkpoint와 옵션을
+`inference_orthogonal_power.py`에 직접 전달하셔도 같은 실행 코드를 사용합니다.
+
+`--receiver_mode gain_estimator --gain_estimator_checkpoint <path>`와 별도의
+`--uniform_receiver_mode`도 지원합니다. Estimator는 해당 segmentation 격자와
+패치 구성에 맞게 학습된 checkpoint가 필요합니다. ImageNet 64블록 estimator를
+Q512에 그대로 사용하면 형상 검증에서 안내 오류를 표시합니다. 기본 수신 모드는
+checkpoint를 지정하지 않으면 oracle, 지정하면 allocated에 gain estimator이며
+uniform은 oracle입니다.
+
+### Cityscapes gain estimator 학습
+
+`train_gain_estimator.py`는 allocator checkpoint에서 ImageNet/Cityscapes를 자동으로
+구분합니다. Cityscapes에서는 입력 해상도와 patch/grid를 유지하고 VAE, Q, allocator를
+고정한 채 estimator만 학습합니다. 기본 Q512에서는 head가 `23554 → 256 → 512`이며
+블록별 log amplitude gain을 예측합니다. `P=1`, 실수 성분별 noise 분산 `N0`, 이미지당
+공통 Rayleigh h 및 송신기의 `max_timestep` gain 하한을 사용합니다. ImageNet의 기존
+학습 동작과 checkpoint 경로는 유지합니다.
+
+현재 segmentation 송신기와 같은 SNR 범위로 학습하는 예시는 다음과 같습니다.
+
+```bash
+torchrun --standalone --nproc_per_node=3 train_gain_estimator.py \
+  --allocator_checkpoint checkpoints_power/Cityscapes/SegFormer-B0/snr_uniform/cityscapes_q512_rayleigh/latest.pth \
+  --exp_name cityscapes_q512_gain_estimator \
+  --data_path /data/bsy --batch 1 --num_workers 4 \
+  --epochs 40 --lr 1e-3 --snr_db_min -3 --snr_db_max 15 \
+  --warmup_epochs 0.5 --warmup_start_factor 0.1 --min_lr_ratio 0.5
+```
+
+기본 Cityscapes batch는 GPU당 1이며 `--batch`로 바꿀 수 있습니다. 송신기의
+gain 하한은 checkpoint에서 읽으며 `--max_timestep`/`--min_gain`으로 명시할 수 있습니다.
+Loss는 기존과 같은 log-gain MSE이며 SNR은 지정한 dB 범위에서 연속 균등 추출합니다.
+저장 경로는 `checkpoints_gain_estimator/Cityscapes/<exp_name>/`이고, `latest.pth`,
+`config.json`, `train.log`를 저장합니다. `--resume`은 같은 frozen Q/allocator와
+격자를 확인한 후 estimator·optimizer·scheduler·AMP scaler 상태를 이어갑니다.
+추론에는 아래 옵션을 기존 segmentation 명령에 추가하시면 됩니다.
+
+```bash
+--receiver_mode gain_estimator \
+--gain_estimator_checkpoint checkpoints_gain_estimator/Cityscapes/cityscapes_q512_gain_estimator/latest.pth
 ```
 
 시각화 명령은 diffusion 없이 전력 배정과 직접 수신 결과만 저장합니다.
@@ -727,7 +815,7 @@ DDRM은 여전히 timestep 999에서 시작합니다. Deep fading으로 floor가
 
 - 학습: `train.log`, `config.json`, `latest.pth`에 Q/allocator/SegFormer 및 optimizer·scheduler·AMP scaler 상태를 저장합니다.
 - 최종 평가: `evaluation/mask2former_ddrm_rayleigh_*.json` 및 같은 이름의 `.log`를 저장합니다. 첫 배치와 기본 20배치마다 중간 결과도 갱신합니다. `--output_path`로 변경하실 수 있습니다.
-- 단일 복원: `inference/sample_*/`에 원본·GT·VAE·직접 수신·DDRM 복원 PNG, 비교 그림, `power_allocation.png`, `result.json`, `latents.pt`를 저장합니다.
+- 단일 복원: 분류와 같은 `inference/sample_*/` 파일명 규칙을 사용합니다. `input.png`, `vae_reconstruction.png`, `direct_reconstructed.png`, `reconstructed.png`, uniform 대응 PNG, `comparison.png`, 실제/추정 timestep을 표시한 `power_allocation.png`, `result.json`을 저장합니다. `allocated_baseband.pt`/`uniform_baseband.pt`에는 Q, raw 관측, 보정 관측, gain, precision, timestep, h/N0와 공통 noise를 기록합니다. Oracle 이미지/state 별칭도 분류와 같습니다.
 - 전력 시각화: `allocation/sample_*/`에 저장합니다. 위 두 단일 이미지 명령은 `--output_dir`로 경로를 변경하실 수 있습니다.
 
 Cityscapes 테스트는 기본 Q512의 직교성·역변환, 해상도·패치 구성, 공통 h와

@@ -204,14 +204,20 @@ class PatchGainEstimator(nn.Module):
     Inputs: R_h=Y/h, log(nu), log(P), without removing the unknown a_b.
     Each block contributes 32 pooled Conv1D features, 6 statistics, and
     an 8-D ID embedding. Default global head: 2946->256->64 (774,080 params).
+    A different group_grid builds a separate model with that block count;
+    existing 64-block checkpoints keep their original state-dict shapes.
     """
 
-    def __init__(self, latent_channels=4, patch_height=8, patch_width=8, hidden_dim=256):
+    def __init__(self, latent_channels=4, patch_height=8, patch_width=8, hidden_dim=256,
+                 group_grid=(8, 8)):
         super().__init__()
+        if len(group_grid) != 2 or any(not isinstance(value, int) or value < 1 for value in group_grid):
+            raise ValueError("Estimator group_grid must be a positive (rows,cols) pair")
         self.latent_channels = latent_channels
         self.patch_height, self.patch_width = patch_height, patch_width
         self.block_dim = latent_channels * patch_height * patch_width
-        self.num_blocks = 64
+        self.group_rows, self.group_cols = group_grid
+        self.num_blocks = self.group_rows * self.group_cols
         self.statistic_names = GAIN_STATISTIC_NAMES
         self.stem = nn.Sequential(
             nn.Conv1d(1, 16, kernel_size=5, padding=2), nn.SiLU(),
@@ -227,14 +233,14 @@ class PatchGainEstimator(nn.Module):
     def forward(self, channel_equalized, log_noise_variance, log_power):
         if channel_equalized.ndim == 4:
             if (channel_equalized.shape[1] != self.latent_channels
-                    or channel_equalized.shape[2] != 8 * self.patch_height
-                    or channel_equalized.shape[3] != 8 * self.patch_width):
-                raise ValueError("R_h shape must match the estimator's 64-block grid and patch shape")
-            blocks = patchify(channel_equalized, 8, 8)
+                    or channel_equalized.shape[2] != self.group_rows * self.patch_height
+                    or channel_equalized.shape[3] != self.group_cols * self.patch_width):
+                raise ValueError("R_h shape must match the estimator's block grid and patch shape")
+            blocks = patchify(channel_equalized, self.group_rows, self.group_cols)
         else:
             blocks = channel_equalized
         if blocks.ndim != 3 or blocks.shape[1:] != (self.num_blocks, self.block_dim):
-            raise ValueError(f"R_h must contain [B,64,{self.block_dim}] real values")
+            raise ValueError(f"R_h must contain [B,{self.num_blocks},{self.block_dim}] real values")
         if log_noise_variance.shape != (blocks.shape[0],) or log_power.shape != (blocks.shape[0],):
             raise ValueError("log(nu) and log(P) must each have shape [B]")
         local_features = self.stem(blocks.reshape(-1, 1, self.block_dim)).mean(dim=-1)
@@ -292,8 +298,14 @@ def load_gain_estimator(checkpoint_path, allocator, device, *, check_allocator_f
     if check_allocator_fingerprint and config.get("allocator_fingerprint") != allocator_fingerprint(allocator):
         raise ValueError("Gain estimator was trained with a different Q/allocator checkpoint")
     estimator = PatchGainEstimator(
-        config["latent_channels"], *config["patch_shape"], config["hidden_dim"]
+        config["latent_channels"], *config["patch_shape"], config["hidden_dim"],
+        group_grid=tuple(config.get("group_grid", (8, 8))),
     ).to(device)
+    expected_grid = (allocator.group_rows, allocator.group_cols)
+    if (estimator.group_rows, estimator.group_cols) != expected_grid or estimator.block_dim != allocator.block_dim:
+        raise ValueError(f"Gain estimator grid/patch differs from transmitter: estimator "
+                         f"{estimator.group_rows}x{estimator.group_cols} blocks, transmitter "
+                         f"{expected_grid[0]}x{expected_grid[1]} blocks. Use a checkpoint trained for this layout.")
     estimator.load_state_dict(checkpoint["estimator"])
     estimator.eval().requires_grad_(False)
     return estimator, config

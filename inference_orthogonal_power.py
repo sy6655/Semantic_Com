@@ -1,11 +1,12 @@
-"""Unified ImageNet Q inference with oracle or estimated gain correction.
+"""Unified ImageNet/Cityscapes Q inference with oracle or estimated gain.
 
-Defaults: AWGN, DDRM, uniform Q=I, allocated Q from the supplied checkpoint.
+Defaults: ImageNet AWGN, Cityscapes Rayleigh, DDRM, uniform Q=I.
 """
 
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -51,6 +52,20 @@ def oracle_receive(raw_received, group_power, n0, h, rows=8, cols=8):
 
 
 def load_input(args, config):
+    if config.get("dataset") == "Cityscapes":
+        from datasets.data_processing import CityscapesSemanticDataset
+        if args.input_image is not None:
+            image_path = Path(args.input_image).expanduser()
+            with Image.open(image_path) as image:
+                tensor = transforms.Compose([
+                    transforms.Resize(tuple(config["input_shape"])), transforms.ToTensor(),
+                ])(image.convert("RGB"))
+            return tensor.unsqueeze(0), None, str(image_path)
+        dataset = CityscapesSemanticDataset(args.data_path or config["data_path"], "val")
+        if not 0 <= args.sample_index < len(dataset):
+            raise ValueError(f"sample_index must be between 0 and {len(dataset) - 1}")
+        tensor, _ = dataset[args.sample_index]
+        return tensor.unsqueeze(0), None, str(dataset.samples[args.sample_index][0])
     image_size = int(config.get("image_size", 512))
     transform = transforms.Compose([
         transforms.Resize(image_size), transforms.CenterCrop(image_size), transforms.ToTensor(),
@@ -162,6 +177,12 @@ def save_power_allocation(strategies, path, rows=8, cols=8, *, display="power"):
 
 
 def run_inference(args, checkpoint_path=None, checkpoint=None):
+    started = time.perf_counter()
+
+    def progress(message):
+        if not getattr(args, "quiet", False):
+            print(message, flush=True)
+
     method = getattr(args, "restoration_method", None) or "ddrm"
     args.restoration_method = method
     method_label = method.upper()
@@ -172,15 +193,28 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
     if checkpoint_path.is_dir():
         checkpoint_path /= "latest.pth"
     if checkpoint is None:
+        progress(f"Loading transmitter checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    allocator, channel, config, _ = load_transmitter(checkpoint_path, device, checkpoint=checkpoint)
+    dataset_name = checkpoint.get("config", {}).get("dataset", "ImageNet")
+    layout = None
+    if dataset_name == "Cityscapes":
+        from segmentation_transport import load_segmentation_transmitter
+        allocator, channel, layout, _, _ = load_segmentation_transmitter(checkpoint_path, device, checkpoint=checkpoint)
+        config = checkpoint["config"]
+        rows, cols = layout.rows, layout.cols
+    else:
+        allocator, channel, config, _ = load_transmitter(checkpoint_path, device, checkpoint=checkpoint)
+        rows, cols = 8, 8
     estimator_path = getattr(args, "gain_estimator_checkpoint", None)
     receiver_mode = getattr(args, "receiver_mode", None) or ("gain_estimator" if estimator_path else "oracle")
     uniform_receiver_mode = getattr(args, "uniform_receiver_mode", None) or "oracle"
     receiver_modes = {"allocated": receiver_mode, "uniform": uniform_receiver_mode}
-    strategy_names = ("uniform",) if getattr(args, "strategy", "both") == "uniform" else ("allocated", "uniform")
+    strategy = getattr(args, "strategy", "both")
+    strategy_names = ("allocated", "uniform") if strategy == "both" else (strategy,)
+    if any(name not in ("allocated", "uniform") for name in strategy_names):
+        raise ValueError("strategy must be both, allocated, or uniform")
     active_receiver_modes = {receiver_modes[name] for name in strategy_names}
-    channel_model = getattr(args, "channel_model", "awgn")
+    channel_model = getattr(args, "channel_model", None) or ("rayleigh" if dataset_name == "Cityscapes" else "awgn")
     if channel_model not in ("rayleigh", "awgn"):
         raise ValueError("channel_model must be rayleigh or awgn")
     if any(mode not in ("gain_estimator", "oracle") for mode in receiver_modes.values()):
@@ -190,33 +224,45 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
     if not 1 <= args.diffusion_steps <= 1000:
         raise ValueError("diffusion_steps must be between 1 and 1000")
     snrs = config.get("snr_db", [10.0])
-    snr_db = float(args.snr_db if args.snr_db is not None else snrs[0])
+    snr_db = float(args.snr_db if args.snr_db is not None else
+                   (sum(snrs) / len(snrs) if dataset_name == "Cityscapes" else snrs[0]))
     if getattr(args, "channel_gain_abs", None) is not None:
         raise ValueError("Use --channel_model awgn for h=1 or --channel_model rayleigh for sampled h")
+    if "gain_estimator" in active_receiver_modes:
+        progress(f"Loading gain estimator: {estimator_path}")
+        estimator, estimator_config = load_gain_estimator(
+            Path(estimator_path) / "latest.pth" if Path(estimator_path).is_dir() else estimator_path,
+            allocator, device, check_allocator_fingerprint=False,
+        )
+    else:
+        estimator, estimator_config = None, None
+    progress(f"{dataset_name}: grid={rows}x{cols}, channel={channel_model}, receivers={receiver_modes}, strategies={strategy_names}")
+    progress("Loading image quality model...")
     lpips_model = load_lpips(device, enabled=getattr(args, "lpips", True), local_files_only=args.local_files_only)
     vae_kwargs = {"local_files_only": args.local_files_only, "torch_dtype": torch.float32}
     if args.vae_path is None:
         vae_kwargs.update(subfolder="vae", revision=config["vae_model_revision"])
+    progress("Loading VAE...")
     vae = _freeze(AutoencoderKL.from_pretrained(args.vae_path or config["vae_model_id"], **vae_kwargs).to(device))
+    if layout is not None and (
+        int(vae.config.latent_channels) != layout.latent_channels
+        or abs(float(vae.config.scaling_factor) - float(config.get("vae_scale", VAE_SCALE))) > 1e-6
+    ):
+        raise ValueError("Cityscapes transport requires the checkpoint's four-channel SD1.5 VAE and scale")
     condition_on_snr = bool(config.get("condition_classifier_on_snr", False))
     classifier = None
-    if "classifier" in checkpoint:
+    if dataset_name == "ImageNet" and "classifier" in checkpoint:
         channels = int(vae.config.latent_channels)
         classifier = build_latent_classifier(config["model"], channels * (2 if condition_on_snr else 1),
                                              config.get("num_classes", 1000)).to(device)
         classifier.load_state_dict(checkpoint["classifier"])
         _freeze(classifier)
-    estimator, estimator_config = (None, None)
     current_fingerprint = allocator_fingerprint(allocator)
-    trained_fingerprint = None
-    if "gain_estimator" in active_receiver_modes:
-        estimator, estimator_config = load_gain_estimator(
-            Path(estimator_path) / "latest.pth" if Path(estimator_path).is_dir() else estimator_path,
-            allocator, device, check_allocator_fingerprint=False,
-        )
-        trained_fingerprint = estimator_config.get("allocator_fingerprint")
+    trained_fingerprint = estimator_config.get("allocator_fingerprint") if estimator_config is not None else None
+    diffusion_dtype = torch.float16 if getattr(args, "amp", False) and device.type == "cuda" else torch.float32
+    progress(f"Loading {method_label} UNet/text encoder: dtype={diffusion_dtype}, steps={args.diffusion_steps}")
     reverse_model = StaggeredReverseDiffusion(
-        args.diffusion_model or config["vae_model_id"], device, torch.float32,
+        args.diffusion_model or config["vae_model_id"], device, diffusion_dtype,
         args.local_files_only, revision=config["vae_model_revision"] if args.diffusion_model is None else None,
         num_inference_steps=args.diffusion_steps,
     )
@@ -230,9 +276,10 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
                        f"_eta_{args.ddrm_eta:g}_etab_{args.ddrm_eta_b:g}")
     channel_suffix = "_awgn" if channel_model == "awgn" else ""
     uniform_suffix = f"_uniform_{uniform_receiver_mode}" if uniform_receiver_mode != receiver_mode else ""
+    strategy_suffix = f"_{strategy}" if strategy != "both" else ""
     output_dir = Path(args.output_dir or checkpoint_path.parent / "inference" /
                       f"sample_{args.sample_index:06d}_snr_{snr_db:g}_seed_{args.seed}_steps_{args.diffusion_steps}"
-                      f"_{receiver_mode}{uniform_suffix}_{method}{sampling_suffix}{channel_suffix}{gain_suffix}")
+                      f"_{receiver_mode}{uniform_suffix}_{method}{sampling_suffix}{channel_suffix}{gain_suffix}{strategy_suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
     image, label, image_path = load_input(args, config)
     image = image.to(device)
@@ -241,7 +288,10 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
     diffusion_generator = torch.Generator(device=device).manual_seed(args.seed + 2)
     vae_scale = float(config.get("vae_scale", VAE_SCALE))
     with torch.no_grad():
+        progress("Encoding input image and sampling the VAE latent...")
         latent = encode_latents(image, vae, vae_generator)
+        if layout is not None:
+            layout.check_latent(latent)
         vae_image = _decode_latent(vae, latent, vae_scale)
         vae_metrics = image_quality(vae_image, image, lpips_model)
         print(f"VAE 복원 PSNR={vae_metrics['psnr_db']:.2f} dB입니다.", flush=True)
@@ -260,7 +310,7 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
         )
         transformed, q = info["channel_input"], info["orthogonal_matrix"]
         energy = info["unscaled_block_energy"]
-        spatial_energy = patchify(latent).square().sum(-1)
+        spatial_energy = patchify(latent, rows, cols).square().sum(-1)
         budget = info["target_frame_energy"]
         frame_channel_uses = info["frame_channel_uses"]
         real_component_count = latent[0].numel()
@@ -278,30 +328,33 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
             channel_input = transformed if uses_q else latent
             observation_q = q if uses_q else identity
             block_energy = energy if uses_q else spatial_energy
-            raw = sample_raw_channel(channel_input, power, n0, h, epsilon=epsilon)
+            raw = sample_raw_channel(channel_input, power, n0, h, rows=rows, cols=cols, epsilon=epsilon)
             if strategy_receiver_mode == "gain_estimator":
-                estimator_input = prepare_gain_estimator_input(raw, n0, h)
+                estimator_input = prepare_gain_estimator_input(raw, n0, h, rows=rows, cols=cols)
                 log_gain = estimator(estimator_input["channel_equalized_latent"],
                                      estimator_input["log_noise_variance"], estimator_input["log_power"])
-                received = gain_estimator_receive(raw, log_gain, n0, h)
+                received = gain_estimator_receive(raw, log_gain, n0, h, rows, cols)
                 observation = received["equalized_latent"]
             else:
-                received = oracle_receive(raw, power, n0, h)
+                received = oracle_receive(raw, power, n0, h, rows, cols)
                 observation = received["observation"]
             true_precision = h.abs().float().square()[:, None] * power.float() / n0[:, None]
             true_timestep = noise_variance_to_diffusion_timestep(true_precision.reciprocal())
             estimated_timestep = noise_variance_to_diffusion_timestep(received["noise_variance"])
             # U_tilde is in the actual transmitter's block coordinates.
             spatial, spatial_info = restore_spatial_latent(
-                observation, {"orthogonal_matrix": observation_q, "group_grid": (8, 8)},
+                observation, {"orthogonal_matrix": observation_q, "group_grid": (rows, cols)},
                 {"noise_variance": received["noise_variance"]},
             )
             direct_task = restored_task = None
             if classifier is not None:
                 direct_task = _task_result(classifier_forward(classifier, spatial, spatial_info, condition_on_snr), label)
             diffusion_generator.set_state(diffusion_state)
+            strategy_started = time.perf_counter()
+            progress(f"{name} ({strategy_receiver_mode}): starting {method_label}, {args.diffusion_steps} steps...")
             try:
                 restored = sampler(observation, received["precision"], observation_q, diffusion_generator,
+                                   rows=rows, cols=cols,
                                    verbose=not getattr(args, "quiet", False))
             except ValueError as error:
                 policy = getattr(sampler, "initialization_policy", None)
@@ -335,8 +388,9 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
                 "mean_real_component_power": (frame_energy[0] / real_component_count).item(),
                 "direct_latent_mse": (spatial - latent).square().mean().item(),
                 f"{method}_latent_mse": (restored - latent).square().mean().item(),
-                "final_observation_loss": observation_loss(restored, observation, received["precision"], observation_q)[0].item(),
+                "final_observation_loss": observation_loss(restored, observation, received["precision"], observation_q, rows, cols)[0].item(),
                 "diffusion": sampler.last_diagnostics,
+                "elapsed_seconds": time.perf_counter() - strategy_started,
             }
             if strategy_receiver_mode == "oracle":
                 results[name]["oracle_amplitude_gain"] = received["amplitude_gain"][0].cpu().tolist()
@@ -377,9 +431,10 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
     labels = ["Original"] + [f"{'Allocated + Q' if name == 'allocated' else 'Uniform, no Q'}: {receiver_modes[name]} {method_label}"
                               for name in images]
     _save_labeled_row(panels, labels, output_dir / "comparison.png")
-    save_power_allocation(results, output_dir / "power_allocation.png", display="timestep")
+    save_power_allocation(results, output_dir / "power_allocation.png", rows, cols, display="timestep")
     result = {"checkpoint": str(checkpoint_path), "epoch": int(checkpoint.get("epoch", -1)) + 1,
-              "dataset": "ImageNet", "sample_index": args.sample_index, "input_image": args.input_image,
+              "dataset": dataset_name, "sample_index": args.sample_index, "input_image": args.input_image,
+              "output_dir": str(output_dir), "strategy": strategy,
               "image_path": image_path, "label": label,
               "vae_latent_method": "sample",
               "min_gain": min_gain,
@@ -406,7 +461,10 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
               "allocator_architecture": config.get("allocator_architecture"),
               "channel_coefficient": {"real": h.real.cpu().tolist(), "imag": h.imag.cpu().tolist()},
               "effective_snr_db": info["allocator_snr_db"].cpu().tolist(),
-              "orthogonal_transform": True, "group_grid": [8, 8], "num_groups": 64,
+              "orthogonal_transform": True, "group_grid": [rows, cols], "num_groups": rows * cols,
+              "latent_shape": list(latent.shape[1:]), "input_shape": list(image.shape[-2:]),
+              "amp": bool(getattr(args, "amp", False)), "diffusion_dtype": str(diffusion_dtype),
+              "elapsed_seconds": time.perf_counter() - started,
               "pilots_per_group": 0, "diffusion_steps": args.diffusion_steps,
               "same_channel_noise_for_strategies": True, "same_diffusion_noise_for_strategies": True,
               "same_channel_coefficient_for_strategies": True,
@@ -415,7 +473,7 @@ def run_inference(args, checkpoint_path=None, checkpoint=None):
               "strategies": results}
     with open(output_dir / "result.json", "w", encoding="utf-8") as file:
         json.dump(result, file, indent=2)
-    print(f"Saved orthogonal ImageNet classification inference to {output_dir}")
+    print(f"Saved orthogonal {dataset_name} inference to {output_dir}", flush=True)
     return result
 
 
@@ -433,10 +491,10 @@ def build_parser(*, include_legacy=False, default_receiver=None):
                         default=None if include_legacy else "oracle",
                         help="Q uniform receiver (default: oracle)")
     parser.add_argument("--gain_estimator_checkpoint", default=None)
-    parser.add_argument("--channel_model", choices=("awgn", "rayleigh"), default="awgn",
-                        help="AWGN with h=1 (default), or one Rayleigh h per image")
+    parser.add_argument("--channel_model", choices=("awgn", "rayleigh"), default="awgn" if include_legacy else None,
+                        help="Default: ImageNet AWGN with h=1, Cityscapes one Rayleigh h per image")
     parser.add_argument("--strategy", choices=("both", "allocated", "uniform"), default="both",
-                        help="allocated/both: allocated Q plus uniform Q=I; uniform: baseline only")
+                        help="both: allocated Q and uniform Q=I; allocated/uniform: run only that strategy")
     parser.add_argument("--min_gain", type=float, default=0.)
     parser.add_argument("--max_timestep", type=int, choices=range(1000), metavar="0..999", default=None,
                         help="Allocation noise ceiling; default 999 for DDRM, opt-in for DPS")
@@ -452,6 +510,8 @@ def build_parser(*, include_legacy=False, default_receiver=None):
     parser.add_argument("--diffusion_model", default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False,
+                        help="Run the diffusion UNet in float16 on CUDA; VAE and transport remain float32")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lpips", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--local_files_only", action=argparse.BooleanOptionalAction, default=False)

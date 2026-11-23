@@ -1,4 +1,4 @@
-"""Train gains of the 64 Q^T-transformed ImageNet transmission blocks."""
+"""Train gains in frozen ImageNet or Cityscapes Q-transformed block space."""
 
 import argparse
 import math
@@ -12,7 +12,8 @@ from diffusers import AutoencoderKL
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
 
-from datasets.data_processing import construct_dataloaders
+from datasets.data_processing import construct_cityscapes_dataloaders, construct_dataloaders
+from inference_power import allocate_power_for_inference
 from orthogonal_power import (
     ALLOCATOR_ARCHITECTURE, GAIN_ESTIMATOR_ARCHITECTURE, GAIN_ESTIMATOR_VERSION,
     GAIN_STATISTIC_NAMES, MEAN_REAL_COMPONENT_POWER, NOISE_REAL_COMPONENT_VARIANCE,
@@ -27,13 +28,17 @@ from train_power_allocator import (
 )
 
 
-def load_transmitter(checkpoint_path, device, *, checkpoint=None):
-    checkpoint_path = Path(checkpoint_path)
+def load_transmitter(checkpoint_path, device, *, checkpoint=None, allow_segmentation=False):
+    checkpoint_path = Path(checkpoint_path).expanduser()
     if checkpoint_path.is_dir():
         checkpoint_path /= "latest.pth"
     if checkpoint is None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
+    if allow_segmentation and config.get("dataset") == "Cityscapes":
+        from segmentation_transport import load_segmentation_transmitter
+        allocator, channel, _, _, path = load_segmentation_transmitter(checkpoint_path, device, checkpoint=checkpoint)
+        return allocator, channel, config, path
     if (config.get("dataset") != "ImageNet" or not config.get("orthogonal_transform")
             or config.get("num_groups") != 64 or config.get("transmission_mode") != "analog"
             or config.get("pilots_per_group") != 0
@@ -52,16 +57,24 @@ def load_transmitter(checkpoint_path, device, *, checkpoint=None):
 
 
 def gain_estimator_step(images, vae, allocator, channel, estimator, snr_db,
-                        temperature=1.0, generator=None):
+                        temperature=1.0, generator=None, *, max_timestep=None, min_gain=0.0):
     # Only the estimator is trained. Q, allocator and VAE stay frozen.
+    module = unwrap_model(allocator)
+    rows, cols = module.group_rows, module.group_cols
     with torch.no_grad():
         latent = encode_latents(images, vae, generator)
         channel_gain = channel.sample_channel_coefficient(latent, generator)
-        _, power, info = allocate_power(latent, snr_db, allocator, channel, temperature,
-                                       channel_coefficient=channel_gain)
+        if max_timestep is None and min_gain == 0:
+            _, power, info = allocate_power(latent, snr_db, allocator, channel, temperature,
+                                           channel_coefficient=channel_gain)
+        else:
+            _, power, info = allocate_power_for_inference(
+                latent, snr_db, allocator, channel, temperature, channel_coefficient=channel_gain,
+                max_timestep=max_timestep, min_gain=min_gain,
+            )
         n0 = channel._noise_spectral_density(latent, snr_db)
-        raw = sample_raw_channel(info["channel_input"], power, n0, channel_gain, generator)
-        estimator_input = prepare_gain_estimator_input(raw, n0, channel_gain)
+        raw = sample_raw_channel(info["channel_input"], power, n0, channel_gain, generator, rows, cols)
+        estimator_input = prepare_gain_estimator_input(raw, n0, channel_gain, rows=rows, cols=cols)
         target_log_gain = 0.5 * power.log()
     predicted_log_gain = estimator(estimator_input["channel_equalized_latent"],
                                    estimator_input["log_noise_variance"], estimator_input["log_power"])
@@ -76,10 +89,13 @@ def run_training():
     parser.add_argument("--allocator_checkpoint", required=True)
     parser.add_argument("--exp_name", required=True)
     parser.add_argument("--data_path", default=None)
-    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="Batch per GPU (default: ImageNet 32, Cityscapes 1)")
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="DataLoader workers; omitted keeps each dataset's existing default")
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--hidden_dim", type=int, default=256,
-                        help="Global MLP hidden width; v4 default is 2946->256->64")
+                        help="Global MLP hidden width; input/output dimensions follow the checkpoint block grid")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--warmup_epochs", type=float, default=0.5,
                         help="Linear warmup duration for new training, measured in epochs")
@@ -90,6 +106,9 @@ def run_training():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--snr_db_min", type=float, default=-10)
     parser.add_argument("--snr_db_max", type=float, default=20)
+    parser.add_argument("--max_timestep", type=int, choices=range(1000), metavar="0..999", default=None,
+                        help="Transmitter gain floor (Cityscapes: allocator checkpoint value, usually 999; ImageNet: off)")
+    parser.add_argument("--min_gain", type=float, default=0., help="Minimum transmit amplitude during estimator training")
     parser.add_argument("--grad_clip", type=float, default=1)
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--resume", default=None)
@@ -100,8 +119,13 @@ def run_training():
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--local_files_only", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
-    if min(args.batch, args.epochs, args.hidden_dim, args.log_interval) <= 0 or args.lr <= 0:
+    if ((args.batch is not None and args.batch <= 0)
+            or min(args.epochs, args.hidden_dim, args.log_interval) <= 0 or args.lr <= 0):
         parser.error("batch, epochs, hidden_dim, log_interval and lr must be positive")
+    if args.num_workers is not None and args.num_workers < 0:
+        parser.error("num_workers must be non-negative")
+    if not math.isfinite(args.min_gain) or args.min_gain < 0:
+        parser.error("min_gain must be finite and non-negative")
     if not math.isfinite(args.warmup_epochs) or not 0 <= args.warmup_epochs < args.epochs:
         parser.error("warmup_epochs must be in [0,epochs)")
     if not math.isfinite(args.warmup_start_factor) or not 0 <= args.warmup_start_factor <= 1:
@@ -112,11 +136,27 @@ def run_training():
         parser.error("snr_db_min must not exceed snr_db_max")
     device, distributed, rank, world_size = initialize_distributed(args.device, args.local_rank)
     torch.manual_seed(args.seed + rank)
-    allocator, channel, transmitter_config, transmitter_path = load_transmitter(args.allocator_checkpoint, device)
-    image_size = int(transmitter_config.get("image_size", 512))
-    if image_size % 64:
-        raise ValueError("Image size must be divisible by 64 for an 8x8 VAE block grid")
-    patch_side = image_size // 64
+    allocator, channel, transmitter_config, transmitter_path = load_transmitter(
+        args.allocator_checkpoint, device, allow_segmentation=True,
+    )
+    dataset_name = transmitter_config.get("dataset", "ImageNet")
+    args.batch = args.batch if args.batch is not None else (1 if dataset_name == "Cityscapes" else 32)
+    if dataset_name == "Cityscapes":
+        rows, cols = transmitter_config["group_grid"]
+        patch_height, patch_width = transmitter_config["patch_shape"]
+        input_shape = transmitter_config["input_shape"]
+        latent_shape = transmitter_config["latent_shape"]
+        image_size = input_shape[0]
+        if args.max_timestep is None:
+            args.max_timestep = int(transmitter_config.get("max_timestep", 999))
+    else:
+        image_size = int(transmitter_config.get("image_size", 512))
+        if image_size % 64:
+            raise ValueError("Image size must be divisible by 64 for an 8x8 VAE block grid")
+        rows = cols = 8
+        patch_height = patch_width = image_size // 64
+        input_shape, latent_shape = [image_size] * 2, [image_size // 8] * 2
+    num_groups = rows * cols
     latent_channels = int(transmitter_config.get("latent_channels", 4))
     vae = AutoencoderKL.from_pretrained(
         transmitter_config["vae_model_id"], subfolder="vae",
@@ -125,11 +165,21 @@ def run_training():
     ).to(device).eval().requires_grad_(False)
     if int(vae.config.latent_channels) != latent_channels:
         raise ValueError("VAE channels do not match transmitter")
-    train_loader, val_loader = construct_dataloaders(
-        "ImageNet", args.data_path or transmitter_config["data_path"], args.batch,
-        normalize=False, image_size=image_size, distributed=distributed, seed=args.seed,
+    if dataset_name == "Cityscapes":
+        train_loader, val_loader = construct_cityscapes_dataloaders(
+            args.data_path or transmitter_config["data_path"], args.batch, distributed, args.seed,
+            4 if args.num_workers is None else args.num_workers,
+        )
+    else:
+        train_loader, val_loader = construct_dataloaders(
+            "ImageNet", args.data_path or transmitter_config["data_path"], args.batch,
+            normalize=False, image_size=image_size, distributed=distributed, seed=args.seed,
+            num_workers=args.num_workers,
+        )
+    estimator = PatchGainEstimator(
+        latent_channels, patch_height, patch_width, args.hidden_dim, group_grid=(rows, cols),
     )
-    estimator = PatchGainEstimator(latent_channels, patch_side, patch_side, args.hidden_dim).to(device)
+    estimator = estimator.to(device)
     if distributed:
         options = {"device_ids": [args.local_rank]} if device.type == "cuda" else {}
         estimator = DistributedDataParallel(estimator, **options)
@@ -137,28 +187,30 @@ def run_training():
     optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
     amp_enabled = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-    output_dir = Path("checkpoints_gain_estimator") / "ImageNet" / args.exp_name
+    output_dir = Path("checkpoints_gain_estimator") / dataset_name / args.exp_name
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
     if distributed:
         dist.barrier()
     logger = build_logger(output_dir / "train.log", rank == 0)
     config = vars(args).copy()
-    config.update(stage="block_gain_estimator", estimator_version=GAIN_ESTIMATOR_VERSION, dataset="ImageNet",
+    config.update(stage="block_gain_estimator", estimator_version=GAIN_ESTIMATOR_VERSION, dataset=dataset_name,
                   estimator_architecture=GAIN_ESTIMATOR_ARCHITECTURE,
                   channel_model=RAYLEIGH_CHANNEL_MODEL, perfect_csi=True,
                   mean_real_component_power=MEAN_REAL_COMPONENT_POWER,
                   fading_granularity="one_complex_h_per_image_shared_by_all_blocks",
-                  latent_channels=latent_channels, patch_shape=[patch_side, patch_side],
+                  latent_channels=latent_channels, patch_shape=[patch_height, patch_width],
                   vae_latent_method="sample",
-                  group_grid=[8, 8], num_groups=64, image_size=image_size,
+                  group_grid=[rows, cols], num_groups=num_groups, image_size=image_size,
+                  input_shape=input_shape, latent_shape=latent_shape,
                   allocator_checkpoint=str(transmitter_path.resolve()),
                   allocator_fingerprint=allocator_fingerprint(allocator),
                   estimator_input="R_h=Y/h,log(nu=N0/abs(h)^2),log(P)",
                   estimator_statistics=list(GAIN_STATISTIC_NAMES),
                   estimator_embedding_dim=8, estimator_conv_channels=[1, 16, 32],
                   estimator_conv_kernel_size=5,
-                  estimator_global_input_dim=2946, estimator_head_dims=[2946, args.hidden_dim, 64],
+                  estimator_global_input_dim=num_groups * 46 + 2,
+                  estimator_head_dims=[num_groups * 46 + 2, args.hidden_dim, num_groups],
                   estimator_parameter_count=sum(p.numel() for p in estimator.parameters()),
                   estimator_output="log_transmit_amplitude_gain", loss="log_gain_mse",
                   precision="abs(h)^2*a_hat^2/N0", noise_real_component_variance=NOISE_REAL_COMPONENT_VARIANCE,
@@ -167,7 +219,8 @@ def run_training():
     if args.resume:
         previous = torch.load(args.resume, map_location=device, weights_only=False)
         for key in ("allocator_fingerprint", "hidden_dim", "patch_shape", "channel_model", "estimator_version",
-                    "noise_real_component_variance", "mean_real_component_power", "estimator_architecture"):
+                    "noise_real_component_variance", "mean_real_component_power", "estimator_architecture",
+                    "dataset", "group_grid", "num_groups", "latent_channels"):
             if previous["config"].get(key) != config[key]:
                 raise ValueError(f"Resume checkpoint mismatch: {key}")
         unwrap_model(estimator).load_state_dict(previous["estimator"])
@@ -182,6 +235,10 @@ def run_training():
         save_config(output_dir / "config.json", config)
     logger.info("lr_schedule=%s resumed=%s next_lr_estimator=%.8g",
                 config["lr_schedule"], previous is not None, optimizer.param_groups[0]["lr"])
+    logger.info("dataset=%s frozen_transmitter=%s grid=%dx%d patch=%dx%d groups=%d "
+                "snr_db_uniform=[%g,%g] max_timestep=%s min_gain=%g mean_real_component_power=1",
+                dataset_name, transmitter_path, rows, cols, patch_height, patch_width, num_groups,
+                args.snr_db_min, args.snr_db_max, args.max_timestep, args.min_gain)
     for epoch in range(start_epoch, args.epochs):
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -201,9 +258,11 @@ def run_training():
                 with torch.set_grad_enabled(training), torch.autocast(
                     device_type=device.type, dtype=torch.float16, enabled=amp_enabled
                 ):
+                    floor_options = ({"max_timestep": args.max_timestep, "min_gain": args.min_gain}
+                                     if args.max_timestep is not None or args.min_gain > 0 else {})
                     result = gain_estimator_step(images, vae, allocator, channel, estimator, snr,
                                                  transmitter_config.get("temperature", 1.0),
-                                                 None if training else generator)
+                                                 None if training else generator, **floor_options)
                 finite = torch.isfinite(result["loss"]).to(torch.int32)
                 if distributed:
                     dist.all_reduce(finite, op=dist.ReduceOp.MIN)

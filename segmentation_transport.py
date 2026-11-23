@@ -1,4 +1,4 @@
-"""Q-mixed, oracle-gain Rayleigh transport for Cityscapes latents."""
+"""Q-mixed Cityscapes transport with paired channel and receiver draws."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +10,8 @@ from inference_oracle_gain import oracle_receive
 from inference_power import allocate_power_for_inference
 from orthogonal_power import (
     ALLOCATOR_ARCHITECTURE, MEAN_REAL_COMPONENT_POWER, NOISE_REAL_COMPONENT_VARIANCE,
-    RAYLEIGH_CHANNEL_MODEL, OrthogonalPatchTransform, patchify, sample_raw_channel,
+    RAYLEIGH_CHANNEL_MODEL, OrthogonalPatchTransform, gain_estimator_receive,
+    patchify, prepare_gain_estimator_input, sample_raw_channel,
 )
 from train_power_allocator import PowerAllocator, RayleighFadingChannel, restore_spatial_latent
 
@@ -108,11 +109,12 @@ def build_segmentation_allocator(layout, hidden_dim=64):
                           group_grid=(layout.rows, layout.cols))
 
 
-def load_segmentation_transmitter(path, device):
+def load_segmentation_transmitter(path, device, *, checkpoint=None):
     path = Path(path).expanduser()
     if path.is_dir():
         path /= "latest.pth"
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint is None:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
     layout = validate_segmentation_config(config)
     allocator = build_segmentation_allocator(layout, int(config["hidden_dim"])).to(device)
@@ -124,7 +126,9 @@ def load_segmentation_transmitter(path, device):
 
 def prepare_segmentation_transmissions(latent, snr_db, allocator, channel, generator=None,
                                       temperature=1.0, max_timestep=999, min_gain=0.0,
-                                      strategies=("uniform", "allocated")):
+                                      strategies=("uniform", "allocated"), *,
+                                      channel_model="rayleigh", receiver_mode="oracle",
+                                      uniform_receiver_mode="oracle", gain_estimator=None):
     """Pair both transmitters using one h per image and common real AWGN.
 
     The learned path uses Q; the uniform baseline transmits spatial latents.
@@ -136,7 +140,17 @@ def prepare_segmentation_transmissions(latent, snr_db, allocator, channel, gener
         raise ValueError("Channel and allocator block grids must match")
     if not strategies or any(name not in ("uniform", "allocated") for name in strategies):
         raise ValueError("Transport strategies must be uniform and/or allocated")
+    if channel_model not in ("rayleigh", "awgn"):
+        raise ValueError("channel_model must be rayleigh or awgn")
+    receiver_modes = {"allocated": receiver_mode, "uniform": uniform_receiver_mode}
+    if any(mode not in ("oracle", "gain_estimator") for mode in receiver_modes.values()):
+        raise ValueError("Receiver modes must be oracle or gain_estimator")
+    if any(receiver_modes[name] == "gain_estimator" for name in strategies) and gain_estimator is None:
+        raise ValueError("Gain estimator reception requires a loaded estimator")
     h = channel.sample_channel_coefficient(latent, generator)
+    # Consume the same h draws in either mode, preserving the paired AWGN stream.
+    if channel_model == "awgn":
+        h = torch.ones_like(h)
     ratio, allocated_power, info = allocate_power_for_inference(
         latent, snr_db, allocator, channel, temperature,
         channel_coefficient=h, max_timestep=max_timestep, min_gain=min_gain,
@@ -158,7 +172,14 @@ def prepare_segmentation_transmissions(latent, snr_db, allocator, channel, gener
         power = allocated_power if uses_q else uniform_power
         block_energy = info["unscaled_block_energy"] if uses_q else energy
         raw = sample_raw_channel(signal, power, n0, h, rows=rows, cols=cols, epsilon=epsilon)
-        received = oracle_receive(raw, power, n0, h, rows, cols)
+        if receiver_modes[name] == "gain_estimator":
+            estimator_input = prepare_gain_estimator_input(raw, n0, h, rows=rows, cols=cols)
+            log_gain = gain_estimator(estimator_input["channel_equalized_latent"],
+                                      estimator_input["log_noise_variance"], estimator_input["log_power"])
+            received = gain_estimator_receive(raw, log_gain, n0, h, rows=rows, cols=cols)
+            received["observation"] = received["equalized_latent"]
+        else:
+            received = oracle_receive(raw, power, n0, h, rows, cols)
         spatial, channel_info = restore_spatial_latent(
             received["observation"],
             {"orthogonal_matrix": matrix, "group_grid": (rows, cols), "source_latent": latent},
@@ -166,6 +187,7 @@ def prepare_segmentation_transmissions(latent, snr_db, allocator, channel, gener
         )
         result[name] = {
             **received, "Q": matrix, "uses_Q": uses_q, "raw_received": raw,
+            "receiver_mode": receiver_modes[name], "true_amplitude_gain": power.sqrt(),
             "transmitted_latent": signal, "direct_latent": spatial,
             "group_power": power, "frame_energy": (power * block_energy).sum(1),
             "energy_allocation_ratio": ratio if uses_q else power * block_energy / budget,
@@ -176,12 +198,19 @@ def prepare_segmentation_transmissions(latent, snr_db, allocator, channel, gener
 
 
 def restore_segmentation_transmissions(transmission, sampler, generator, verbose=False):
+    """Accept one shared sampler or a strategy-to-sampler mapping."""
     rows, cols = transmission["layout"]
     initial_state = generator.get_state()
     restored, diagnostics = {}, {}
     for name, received in transmission["strategies"].items():
+        strategy_sampler = sampler[name] if isinstance(sampler, dict) else sampler
         generator.set_state(initial_state)
-        restored[name] = sampler(received["observation"], received["precision"], received["Q"],
-                                 generator, rows=rows, cols=cols, verbose=verbose)
-        diagnostics[name] = sampler.last_diagnostics
+        try:
+            restored[name] = strategy_sampler(received["observation"], received["precision"], received["Q"],
+                                             generator, rows=rows, cols=cols, verbose=verbose)
+        except ValueError as error:
+            policy = getattr(strategy_sampler, "initialization_policy", None)
+            raise ValueError(f"Restoration failed: strategy={name}, receiver_mode={received['receiver_mode']}, "
+                             f"initialization_policy={policy}: {error}") from error
+        diagnostics[name] = strategy_sampler.last_diagnostics
     return restored, diagnostics

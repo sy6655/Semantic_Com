@@ -1,4 +1,9 @@
-"""Evaluate diffusion-restored transmissions with pretrained Mask2Former."""
+"""Evaluate VAE / uniform / Q-allocated Cityscapes RGB with pretrained Mask2Former.
+
+The default Q path supports AWGN/Rayleigh, oracle/gain-estimator reception,
+paired multi-SNR evaluation, pixel accuracy/mIoU and full-RGB PSNR/LPIPS.
+The original non-Q implementation is available with --legacy_awgn.
+"""
 
 import argparse
 import json
@@ -49,6 +54,24 @@ def update_confusion(
         latent / float(vae.config.scaling_factor)
     ).sample
     reconstructed_rgb = (decoded / 2.0 + 0.5).clamp(0.0, 1.0)
+    update_confusion_rgb(matrix, evaluator, reconstructed_rgb, labels)
+
+
+def update_confusion_rgb(
+    matrix: torch.Tensor,
+    evaluator: torch.nn.Module,
+    reconstructed_rgb: torch.Tensor,
+    labels: torch.Tensor,
+) -> None:
+    """Evaluate the same decoded RGB used for reconstruction quality metrics.
+
+    The pretrained Cityscapes Swin config expects RGB in [0,255] and applies
+    its own normalization. Labels remain 19 trainIds with ignore index 255.
+    """
+    if (reconstructed_rgb.ndim != 4 or reconstructed_rgb.shape[1] != 3
+            or reconstructed_rgb.shape[0] != labels.shape[0]
+            or reconstructed_rgb.shape[-2:] != labels.shape[-2:]):
+        raise ValueError("Mask2Former evaluation requires matching RGB images and semantic labels")
     height, width = labels.shape[-2:]
     predictions = evaluator(
         [
@@ -60,6 +83,8 @@ def update_confusion(
             for image in reconstructed_rgb
         ]
     )
+    if len(predictions) != len(labels):
+        raise ValueError("Mask2Former must return one prediction per image")
     for prediction, label in zip(predictions, labels):
         scores = prediction["sem_seg"]
         if scores.shape != (NUM_CLASSES, *label.shape):

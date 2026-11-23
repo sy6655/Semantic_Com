@@ -18,8 +18,9 @@ from PIL import Image
 
 from ddrm_sampling import OrthogonalDDRM
 from orthogonal_power import (
-    ALLOCATOR_ARCHITECTURE, RAYLEIGH_CHANNEL_MODEL, OrthogonalPatchTransform,
-    apply_complex_channel, block_map, patchify,
+    ALLOCATOR_ARCHITECTURE, GAIN_ESTIMATOR_ARCHITECTURE, GAIN_ESTIMATOR_VERSION,
+    RAYLEIGH_CHANNEL_MODEL, OrthogonalPatchTransform, PatchGainEstimator,
+    apply_complex_channel, block_map, load_gain_estimator, patchify, sample_raw_channel,
 )
 from power_utils import sd15_alpha_bars
 from segmentation_orthogonal_power import evaluate, parse_arguments, run_single
@@ -57,6 +58,8 @@ class TinyTask(torch.nn.Module):
 
 
 class TinyCityscapes(torch.utils.data.Dataset):
+    samples = [(Path(f"test_{index}.png"), None, True) for index in range(3)]
+
     def __len__(self):
         return 3
 
@@ -74,6 +77,19 @@ class TinyMask2Former(torch.nn.Module):
             logits[0] = 1
             result.append({"sem_seg": logits})
         return result
+
+
+def tiny_reverse_model():
+    scheduler = DDIMScheduler(beta_start=.00085, beta_end=.012, beta_schedule="scaled_linear",
+                              timestep_spacing="trailing", clip_sample=False)
+
+    def schedule(device):
+        scheduler.set_timesteps(2, device=device)
+        return scheduler.timesteps
+
+    return SimpleNamespace(scheduler=scheduler, dtype=torch.float32, inference_timesteps=schedule,
+                           _empty_prompt_embedding=lambda batch: torch.zeros(batch, 1, 1),
+                           unet=lambda x, t, encoder_hidden_states: SimpleNamespace(sample=.1*x))
 
 
 class PairedSampler:
@@ -277,7 +293,7 @@ class SegmentationTransportTests(unittest.TestCase):
             checkpoint_path = Path(directory) / "latest.pth"
             torch.save({"config": config, "allocator": allocator.state_dict(), "epoch": 0}, checkpoint_path)
             args = parse_arguments("evaluation", ["--checkpoint", str(checkpoint_path), "--device", "cpu",
-                                   "--snr_db", "0", "--batch", "2", "--num_workers", "0", "--max_samples", "3"])
+                                   "--snr_db", "0", "--batch", "2", "--num_workers", "0", "--max_samples", "3", "--no-lpips"])
             self.assertEqual(args.restoration_method, "ddrm")
             sampler = PairedSampler()
             with patch("segmentation_orthogonal_power.CityscapesSemanticDataset", return_value=TinyCityscapes()), \
@@ -288,7 +304,7 @@ class SegmentationTransportTests(unittest.TestCase):
                 self.assertEqual(result["num_samples"], 3)
                 self.assertTrue(result["complete"])
                 self.assertEqual(result["miou"], 1.)
-                self.assertEqual(set(result["strategies"]), {"uniform", "allocated", "uncompressed"})
+                self.assertEqual(set(result["strategies"]), {"uniform", "allocated", "vae"})
                 for name in ("uniform", "allocated"):
                     metrics = result["strategies"][name]
                     self.assertEqual(metrics["ddrm_initialization_clipped_blocks"], 3 * 512)
@@ -300,17 +316,393 @@ class SegmentationTransportTests(unittest.TestCase):
                 self.assertEqual(json.loads(saved_path.read_text())["num_samples"], 3)
                 self.assertTrue(saved_path.with_suffix(".log").is_file())
                 single = parse_arguments("inference", ["--checkpoint", str(checkpoint_path), "--device", "cpu",
-                                         "--snr_db", "0", "--output_dir", str(Path(directory) / "inference")])
-                output = run_single(single)
+                                         "--snr_db", "0", "--diffusion_steps", "2", "--no-lpips", "--quiet",
+                                         "--output_dir", str(Path(directory) / "inference")])
+                with patch("datasets.data_processing.CityscapesSemanticDataset", return_value=TinyCityscapes()), \
+                        patch("inference_orthogonal_power.AutoencoderKL.from_pretrained", return_value=TinyVAE().eval()), \
+                        patch("inference_orthogonal_power.StaggeredReverseDiffusion", side_effect=lambda *args, **kwargs: tiny_reverse_model()):
+                    output = run_single(single)
                 out = Path(output["output_dir"])
-                for filename in ("input.png", "ground_truth.png", "power_allocation.png", "result.json",
-                                 "latents.pt", "allocated_ddrm.png", "uniform_ddrm.png", "denoised_comparison.png"):
+                for filename in ("input.png", "power_allocation.png", "result.json", "vae_reconstruction.png",
+                                 "allocated_baseband.pt", "uniform_baseband.pt", "reconstructed.png",
+                                 "uniform_reconstructed.png", "comparison.png", "allocated_oracle_ddrm.png"):
                     self.assertTrue((out / filename).is_file(), msg=filename)
                 self.assertEqual(Image.open(out / "input.png").getpixel((0, 0)), (51, 51, 51))
-                state = torch.load(out / "latents.pt", weights_only=True)
+                state = torch.load(out / "allocated_baseband.pt", weights_only=True)
                 self.assertEqual(state["Q"].shape, (512, 512))
-                self.assertEqual(state["allocated"]["precision"].shape, (1, 512))
-                self.assertEqual(output["strategies"]["allocated"]["diffusion"]["initialization_clipped_block_count"], 512)
+                self.assertEqual(state["precision"].shape, (1, 512))
+                self.assertEqual(output["dataset"], "Cityscapes")
+                self.assertEqual(output["group_grid"], [16, 32])
+                self.assertFalse(output["uses_classifier"])
+                self.assertEqual(output["strategies"]["allocated"]["diffusion"]["initialization_policy"], "clip")
+                self.assertEqual(len(output["strategies"]["allocated"]["true_timestep"]), 512)
+
+    def test_evaluation_subset_and_output_paths_are_reproducible(self):
+        from segmentation_orthogonal_power import evaluation_output_path, select_evaluation_indices
+
+        args = parse_arguments("evaluation", ["--checkpoint", "unused.pth", "--device", "cpu",
+                               "--snr_db", "-5", "5", "--channel_model", "awgn",
+                               "--gain_estimator_checkpoint", "gain.pth", "--max_samples", "2",
+                               "--output_path", "/tmp/seg_eval.json"])
+        self.assertEqual(args.receiver_mode, "gain_estimator")
+        self.assertEqual(args.uniform_receiver_mode, "oracle")
+        self.assertEqual(args.snr_db, [-5., 5.])
+        dataset = range(100)
+        before = torch.random.get_rng_state()
+        indices = select_evaluation_indices(dataset, 10, 42)
+        torch.testing.assert_close(torch.random.get_rng_state(), before)
+        self.assertEqual(indices, select_evaluation_indices(dataset, 10, 42))
+        self.assertNotEqual(indices, select_evaluation_indices(dataset, 10, 43))
+        self.assertEqual(len(set(indices)), 10)
+        self.assertEqual(sorted(indices), indices)
+        self.assertEqual(select_evaluation_indices(dataset, None, 42), list(range(100)))
+        self.assertEqual(evaluation_output_path(args, Path("unused.pth"), -5, 2), Path("/tmp/seg_eval_snr_-5.json"))
+        args.output_path = None
+        estimated = evaluation_output_path(args, Path("unused.pth"), -5, 2)
+        args.receiver_mode = "oracle"
+        oracle = evaluation_output_path(args, Path("unused.pth"), -5, 2)
+        self.assertNotEqual(estimated, oracle)
+        self.assertIn("_awgn_snr_-5_", estimated.name)
+
+    def test_evaluation_pairs_multiple_snrs_and_handles_estimator_and_oracle_noise_overflow(self):
+        import segmentation_orthogonal_power as evaluation
+
+        class QualityModel(torch.nn.Module):
+            def forward(self, left, right):
+                return (left - right).abs().mean(dim=(1, 2, 3), keepdim=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            layout = SegmentationLayout()
+            allocator = self.allocator(layout)
+            transmitter_path = Path(directory) / "latest.pth"
+            torch.save({"config": checkpoint_config(layout), "allocator": allocator.state_dict(), "epoch": 4}, transmitter_path)
+            estimator = PatchGainEstimator(4, 8, 8, 8, group_grid=(16, 32))
+            with torch.no_grad():
+                estimator.log_gain_head.bias.fill_(-4.)
+            estimator_path = Path(directory) / "gain.pth"
+            torch.save({"estimator": estimator.state_dict(), "config": {
+                "stage": "block_gain_estimator", "estimator_version": GAIN_ESTIMATOR_VERSION,
+                "estimator_architecture": GAIN_ESTIMATOR_ARCHITECTURE, "channel_model": RAYLEIGH_CHANNEL_MODEL,
+                "noise_real_component_variance": "N0", "mean_real_component_power": 1.,
+                "latent_channels": 4, "patch_shape": [8, 8], "hidden_dim": 8, "group_grid": [16, 32],
+                "allocator_fingerprint": "different-training-checkpoint",
+            }}, estimator_path)
+            vae = TinyVAE().eval()
+            original_transmit = evaluation._transmit
+            for channel_model in ("awgn", "rayleigh"):
+                with self.subTest(channel_model=channel_model):
+                    transmissions, source_latents = [], []
+
+                    def capture(*args, **kwargs):
+                        source_latents.append(args[1].clone())
+                        transmission = original_transmit(*args, **kwargs)
+                        transmissions.append(transmission)
+                        return transmission
+
+                    args = parse_arguments("evaluation", ["--checkpoint", str(transmitter_path), "--device", "cpu",
+                                           "--gain_estimator_checkpoint", str(estimator_path), "--snr_db", "-5", "5",
+                                           "--channel_model", channel_model, "--max_samples", "2", "--batch_size", "2",
+                                           "--num_workers", "0", "--diffusion_steps", "2", "--seed", "42",
+                                           "--output_path", str(Path(directory) / f"{channel_model}.json")])
+                    with patch.object(evaluation, "CityscapesSemanticDataset", return_value=TinyCityscapes()), \
+                            patch.object(evaluation, "_load_vae", return_value=vae), \
+                            patch.object(evaluation, "load_lpips", return_value=QualityModel()), \
+                            patch.object(evaluation, "_transmit", side_effect=capture), \
+                            patch.object(evaluation, "StaggeredReverseDiffusion", side_effect=lambda *a, **kw: tiny_reverse_model()) as backend, \
+                            patch("models.models.construct_model", return_value=TinyMask2Former()) as model, \
+                            patch.object(RayleighFadingChannel, "sample_channel_coefficient",
+                                         side_effect=lambda z, generator: torch.full((z.shape[0],), .001 + .001j)):
+                        result = evaluate(args)
+                    self.assertEqual(backend.call_count, 1)
+                    model.assert_called_once_with("Mask2Former")
+                    self.assertFalse(result["gain_estimator_allocator_matches"])
+                    self.assertEqual(result["strategy_receiver_modes"], {"uniform": "oracle", "allocated": "gain_estimator"})
+                    self.assertEqual(len(result["sample_selection"]["indices"]), 2)
+                    self.assertEqual(set(result["evaluations"]), {"-5", "5"})
+                    torch.testing.assert_close(source_latents[0], source_latents[1], atol=0, rtol=0)
+                    torch.testing.assert_close(transmissions[0]["epsilon"], transmissions[1]["epsilon"], atol=0, rtol=0)
+                    torch.testing.assert_close(transmissions[0]["h"], transmissions[1]["h"], atol=0, rtol=0)
+                    for snr, transmission in zip((-5, 5), transmissions):
+                        saved_path = Path(directory) / f"{channel_model}_snr_{snr}.json"
+                        saved = json.loads(saved_path.read_text())
+                        self.assertTrue(saved_path.with_suffix(".log").is_file())
+                        self.assertEqual(set(saved["evaluations"]), {str(snr)})
+                        self.assertEqual(saved["sample_selection"]["indices"], result["sample_selection"]["indices"])
+                        self.assertEqual(saved["num_samples"], 2)
+                        for name, metrics in saved["strategies"].items():
+                            self.assertEqual(metrics["num_valid_pixels"], 2 * (16 * 32 - 1))
+                            self.assertEqual(metrics["miou"], 1.)
+                            self.assertTrue(torch.isfinite(torch.tensor([metrics["psnr_db"], metrics["lpips"]])).all())
+                            if name != "vae":
+                                self.assertAlmostEqual(metrics["mean_real_component_power"], 1., places=5)
+                        self.assertEqual(saved["strategies"]["allocated"]["ddrm_initialization_clipped_blocks"], 1024)
+                        if channel_model == "awgn":
+                            self.assertEqual(saved["mean_h_power"], 1.)
+                            self.assertEqual(saved["strategies"]["uniform"]["ddrm_initialization_clipped_blocks"], 0)
+                        else:
+                            self.assertEqual(saved["strategies"]["uniform"]["ddrm_initialization_clipped_blocks"], 1024)
+                        for name, received in transmission["strategies"].items():
+                            gain = torch.full((2, 512), torch.exp(torch.tensor(-4.)).item()) if name == "allocated" else received["group_power"].sqrt()
+                            expected = transmission["h"].abs()[:, None].square() * gain.square() / transmission["N0"][:, None]
+                            torch.testing.assert_close(received["precision"], expected)
+                            torch.testing.assert_close(received["raw_received"],
+                                sample_raw_channel(
+                                    received["transmitted_latent"], received["group_power"], transmission["N0"],
+                                    transmission["h"], rows=16, cols=32, epsilon=transmission["epsilon"]), atol=0, rtol=0)
+
+    def test_vae_only_evaluation_skips_diffusion_and_gain_estimator(self):
+        import segmentation_orthogonal_power as evaluation
+
+        with tempfile.TemporaryDirectory() as directory:
+            allocator = self.allocator(SegmentationLayout())
+            path = Path(directory) / "latest.pth"
+            torch.save({"config": checkpoint_config(SegmentationLayout()), "allocator": allocator.state_dict()}, path)
+            args = parse_arguments("evaluation", ["--checkpoint", str(path), "--device", "cpu", "--strategy", "uncompressed",
+                                   "--gain_estimator_checkpoint", "not-needed.pth", "--num_workers", "0", "--no-lpips"])
+            with patch.object(evaluation, "CityscapesSemanticDataset", return_value=TinyCityscapes()), \
+                    patch.object(evaluation, "_load_vae", return_value=TinyVAE().eval()), \
+                    patch.object(evaluation, "load_gain_estimator") as estimator, \
+                    patch.object(evaluation, "_build_sampler") as sampler, \
+                    patch("models.models.construct_model", return_value=TinyMask2Former()):
+                result = evaluate(args)
+            estimator.assert_not_called()
+            sampler.assert_not_called()
+            self.assertEqual(set(result["strategies"]), {"vae"})
+            self.assertEqual(result["num_samples"], 3)
+            self.assertIsNone(result["mean_h_power"])
+            self.assertIsNone(result["strategies"]["vae"]["lpips"])
+
+    def test_cityscapes_gain_estimator_uses_its_own_grid_and_rejects_imagenet_checkpoint(self):
+        layout = SegmentationLayout()
+        allocator = self.allocator(layout)
+        estimator = PatchGainEstimator(4, 8, 8, 8, group_grid=(16, 32))
+        config = {
+            "stage": "block_gain_estimator", "estimator_version": GAIN_ESTIMATOR_VERSION,
+            "estimator_architecture": GAIN_ESTIMATOR_ARCHITECTURE, "channel_model": RAYLEIGH_CHANNEL_MODEL,
+            "noise_real_component_variance": "N0", "mean_real_component_power": 1.,
+            "latent_channels": 4, "patch_shape": [8, 8], "hidden_dim": 8, "group_grid": [16, 32],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gain.pth"
+            torch.save({"estimator": estimator.state_dict(), "config": config}, path)
+            loaded, _ = load_gain_estimator(path, allocator, "cpu", check_allocator_fingerprint=False)
+            output = loaded(torch.randn(1, 4, 128, 256), torch.zeros(1), torch.zeros(1))
+            self.assertEqual(output.shape, (1, 512))
+            torch.testing.assert_close(output, torch.zeros_like(output))
+            config["group_grid"] = [8, 8]
+            torch.save({"estimator": PatchGainEstimator(4, 8, 8, 8).state_dict(), "config": config}, path)
+            with self.assertRaisesRegex(ValueError, "8x8 blocks, transmitter 16x32"):
+                load_gain_estimator(path, allocator, "cpu", check_allocator_fingerprint=False)
+
+    def test_cityscapes_gain_training_freezes_transmitter_resumes_and_connects_to_inference(self):
+        import train_gain_estimator as gain_training
+
+        layout = SegmentationLayout()
+        allocator = self.allocator(layout)
+        config = checkpoint_config(layout)
+        config["max_timestep"] = 999
+        train_loader = torch.utils.data.DataLoader(torch.utils.data.Subset(TinyCityscapes(), [0, 1]), batch_size=1)
+        val_loader = torch.utils.data.DataLoader(torch.utils.data.Subset(TinyCityscapes(), [2]), batch_size=1)
+        previous_directory = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                os.chdir(directory)
+                transmitter_path = Path(directory) / "transmitter.pth"
+                torch.save({"config": config, "allocator": allocator.state_dict(), "epoch": 0}, transmitter_path)
+                with self.assertRaisesRegex(ValueError, "ImageNet"):
+                    gain_training.load_transmitter(transmitter_path, "cpu")
+                frozen, channel, _, _ = gain_training.load_transmitter(transmitter_path, "cpu", allow_segmentation=True)
+                self.assertEqual((frozen.group_rows, frozen.group_cols), (16, 32))
+                self.assertFalse(any(parameter.requires_grad for parameter in frozen.parameters()))
+                frozen_state = copy.deepcopy(frozen.state_dict())
+                vae = TinyVAE()
+                vae_state = copy.deepcopy(vae.state_dict())
+                argv = ["train_gain_estimator.py", "--allocator_checkpoint", str(transmitter_path),
+                        "--exp_name", "city_gain", "--device", "cpu", "--epochs", "1", "--hidden_dim", "8",
+                        "--num_workers", "0", "--log_interval", "1", "--snr_db_min", "-3", "--snr_db_max", "15"]
+                output_path = Path("checkpoints_gain_estimator/Cityscapes/city_gain/latest.pth")
+
+                def run_training():
+                    with patch("sys.argv", argv), \
+                            patch.object(gain_training, "load_transmitter", return_value=(frozen, channel, config, transmitter_path)), \
+                            patch.object(gain_training.AutoencoderKL, "from_pretrained", return_value=vae), \
+                            patch.object(gain_training, "construct_cityscapes_dataloaders", return_value=(train_loader, val_loader)) as loader, \
+                            patch.object(gain_training, "allocate_power_for_inference", wraps=gain_training.allocate_power_for_inference) as allocate:
+                        gain_training.run_training()
+                    self.assertEqual(loader.call_args.args[1], 1)  # Cityscapes-specific batch default.
+                    self.assertEqual(loader.call_args.args[-1], 0)
+                    self.assertEqual(allocate.call_count, 3)
+                    for call in allocate.call_args_list:
+                        self.assertEqual(call.kwargs["max_timestep"], 999)
+                        self.assertEqual(call.kwargs["min_gain"], 0.)
+                    self.close_loggers()
+                    return torch.load(output_path, weights_only=False)
+
+                checkpoint = run_training()
+                self.assertEqual(checkpoint["config"]["dataset"], "Cityscapes")
+                self.assertEqual(checkpoint["config"]["group_grid"], [16, 32])
+                self.assertEqual(checkpoint["config"]["patch_shape"], [8, 8])
+                self.assertEqual(checkpoint["config"]["input_shape"], [1024, 2048])
+                self.assertEqual(checkpoint["config"]["estimator_head_dims"], [23554, 8, 512])
+                self.assertEqual(checkpoint["global_step"], 2)
+                self.assertEqual(checkpoint["scheduler"]["last_epoch"], 2)
+                self.assertTrue(torch.isfinite(torch.tensor(checkpoint["metrics"]["val"]["log_gain_mse"])))
+                self.assertGreater(checkpoint["estimator"]["log_gain_head.weight"].abs().sum().item(), 0)
+                trained_head = checkpoint["estimator"]["log_gain_head.weight"].clone()
+                argv[argv.index("--epochs") + 1] = "2"
+                argv.extend(["--resume", str(output_path)])
+                resumed = run_training()
+                self.assertEqual(resumed["global_step"], 4)
+                self.assertEqual(resumed["scheduler"]["last_epoch"], 4)
+                self.assertFalse(torch.equal(resumed["estimator"]["log_gain_head.weight"], trained_head))
+                for key in frozen_state:
+                    torch.testing.assert_close(frozen.state_dict()[key], frozen_state[key], rtol=0, atol=0)
+                for key in vae_state:
+                    torch.testing.assert_close(vae.state_dict()[key], vae_state[key], rtol=0, atol=0)
+                self.assertTrue(all(parameter.grad is None for parameter in frozen.parameters()))
+                self.assertTrue(all(parameter.grad is None for parameter in vae.parameters()))
+                estimator, _ = load_gain_estimator(output_path, frozen, "cpu")
+                self.assertEqual(estimator.num_blocks, 512)
+                args = parse_arguments("inference", ["--checkpoint", str(transmitter_path), "--device", "cpu",
+                                      "--gain_estimator_checkpoint", str(output_path), "--strategy", "allocated",
+                                      "--diffusion_steps", "2", "--snr_db", "0", "--no-lpips", "--quiet",
+                                      "--output_dir", str(Path(directory) / "inference")])
+                with patch("datasets.data_processing.CityscapesSemanticDataset", return_value=TinyCityscapes()), \
+                        patch("inference_orthogonal_power.AutoencoderKL.from_pretrained", return_value=vae), \
+                        patch("inference_orthogonal_power.StaggeredReverseDiffusion", side_effect=lambda *args, **kwargs: tiny_reverse_model()):
+                    result = run_single(args)
+                self.assertEqual(result["receiver_mode"], "gain_estimator")
+                self.assertEqual(len(result["strategies"]["allocated"]["estimated_amplitude_gain"]), 512)
+                self.assertEqual(result["strategies"]["allocated"]["diffusion"]["initialization_policy"], "clip")
+            finally:
+                self.close_loggers()
+                os.chdir(previous_directory)
+
+    def test_unified_cityscapes_input_image_and_shared_cli_options(self):
+        from inference_orthogonal_power import load_input
+        config = checkpoint_config(SegmentationLayout())
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "input.png"
+            Image.new("RGB", (20, 10), (30, 40, 50)).save(image_path)
+            args = parse_arguments("inference", ["--checkpoint", "unused.pth", "--device", "cpu",
+                                  "--input_image", str(image_path), "--amp", "--quiet", "--no-lpips",
+                                  "--no_save_latents", "--strategy", "allocated"])
+            image, label, path = load_input(args, config)
+            self.assertEqual(image.shape, (1, 3, 1024, 2048))
+            self.assertIsNone(label)
+            self.assertEqual(path, str(image_path))
+            self.assertTrue(args.amp)
+            self.assertTrue(args.quiet)
+            self.assertTrue(args.no_save_latents)
+            self.assertFalse(args.lpips)
+            self.assertEqual(args.diffusion_steps, 25)
+
+    def test_unified_segmentation_dps_uses_dynamic_grid(self):
+        layout = SegmentationLayout()
+        allocator = self.allocator(layout)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "latest.pth"
+            torch.save({"allocator": allocator.state_dict(), "config": checkpoint_config(layout), "epoch": 0}, checkpoint_path)
+            args = parse_arguments("inference", ["--checkpoint", str(checkpoint_path), "--device", "cpu",
+                                  "--restoration_method", "dps", "--diffusion_steps", "2", "--quiet", "--no-lpips",
+                                  "--strategy", "allocated", "--output_dir", str(Path(directory) / "out")])
+            with patch("datasets.data_processing.CityscapesSemanticDataset", return_value=TinyCityscapes()), \
+                    patch("inference_orthogonal_power.AutoencoderKL.from_pretrained", return_value=TinyVAE().eval()), \
+                    patch("inference_orthogonal_power.StaggeredReverseDiffusion", side_effect=lambda *args, **kwargs: tiny_reverse_model()):
+                result = run_single(args)
+            self.assertEqual(set(result["strategies"]), {"allocated"})
+            self.assertEqual(result["restoration_method"], "dps")
+            self.assertIn("psnr_db", result["strategies"]["allocated"]["dps_vs_input"])
+            self.assertEqual(result["strategies"]["allocated"]["diffusion"]["timesteps"], [999, 499])
+
+    def test_unified_segmentation_inference_modes_quality_and_strategy_selection(self):
+        from inference_orthogonal_power import run_inference
+
+        layout = SegmentationLayout()
+        allocator = self.allocator(layout)
+        config = checkpoint_config(layout)
+        cases = (("rayleigh", "both", "oracle", "oracle"),
+                 ("awgn", "both", "gain_estimator", "oracle"),
+                 ("rayleigh", "both", "oracle", "gain_estimator"),
+                 ("awgn", "allocated", "oracle", "oracle"),
+                 ("awgn", "uniform", "oracle", "oracle"))
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            checkpoint_path = directory / "latest.pth"
+            # An unrelated segmenter state must never trigger an added task evaluator.
+            torch.save({"allocator": allocator.state_dict(), "config": config,
+                        "segmenter": {"unused": torch.zeros(1)}, "epoch": 0}, checkpoint_path)
+            for channel_model, strategy, allocated_mode, uniform_mode in cases:
+                with self.subTest(channel=channel_model, strategy=strategy, modes=(allocated_mode, uniform_mode)):
+                    folder = directory / f"{channel_model}_{strategy}_{allocated_mode}_{uniform_mode}"
+                    arguments = ["--checkpoint", str(checkpoint_path), "--device", "cpu", "--snr_db", "0",
+                                 "--diffusion_steps", "2", "--output_dir", str(folder), "--channel_model", channel_model,
+                                 "--receiver_mode", allocated_mode, "--uniform_receiver_mode", uniform_mode,
+                                 "--strategy", strategy, "--quiet"]
+                    needs_estimator = "gain_estimator" in (allocated_mode, uniform_mode)
+                    if needs_estimator:
+                        arguments += ["--gain_estimator_checkpoint", "cityscapes_gain.pth"]
+                    if strategy == "allocated":
+                        arguments += ["--no_save_latents"]
+                    args = parse_arguments("inference", arguments)
+                    estimator = PatchGainEstimator(4, 8, 8, 8, group_grid=(16, 32)).eval()
+                    fake_lpips = lambda reference, reconstructed: (reference-reconstructed).square().mean((1, 2, 3), keepdim=True)
+                    with patch("datasets.data_processing.CityscapesSemanticDataset", return_value=TinyCityscapes()), \
+                            patch("inference_orthogonal_power.AutoencoderKL.from_pretrained", return_value=TinyVAE().eval()), \
+                            patch("inference_orthogonal_power.StaggeredReverseDiffusion", side_effect=lambda *args, **kwargs: tiny_reverse_model()) as reverse, \
+                            patch("inference_orthogonal_power.load_gain_estimator", return_value=(estimator, {})), \
+                            patch("inference_orthogonal_power.load_lpips", return_value=fake_lpips), \
+                            patch("train_segmentation_power_allocator.LatentSegFormerB0", side_effect=AssertionError("No task evaluator in inference")):
+                        result = run_inference(args)
+                    expected = ("allocated", "uniform") if strategy == "both" else (strategy,)
+                    self.assertEqual(set(result["strategies"]), set(expected))
+                    self.assertEqual(reverse.call_count, 1)
+                    self.assertEqual(result["receiver_mode"], allocated_mode)
+                    self.assertEqual(result["channel_model"], "awgn" if channel_model == "awgn" else RAYLEIGH_CHANNEL_MODEL)
+                    shared_h = shared_epsilon = None
+                    for name in expected:
+                        row = result["strategies"][name]
+                        mode = allocated_mode if name == "allocated" else uniform_mode
+                        self.assertEqual(row["receiver_mode"], mode)
+                        self.assertIn("psnr_db", row["direct_vs_input"])
+                        self.assertIn("lpips", row["ddrm_vs_input"])
+                        self.assertIsNone(row["task_direct"])
+                        self.assertIsNone(row["task_diffusion"])
+                        self.assertEqual(len(row["estimated_timestep"]), 512)
+                        self.assertEqual(row["diffusion"]["initialization_policy"], "clip")
+                        if strategy == "allocated":
+                            self.assertFalse((folder / f"{name}_baseband.pt").exists())
+                            continue
+                        state = torch.load(folder / f"{name}_baseband.pt", weights_only=True)
+                        self.assertEqual(state["Q"].shape, (512, 512))
+                        self.assertEqual(state["true_timestep"].shape, (1, 512))
+                        if shared_h is None:
+                            shared_h, shared_epsilon = state["channel_coefficient"], state["epsilon"]
+                        torch.testing.assert_close(state["channel_coefficient"], shared_h, rtol=0, atol=0)
+                        torch.testing.assert_close(state["epsilon"], shared_epsilon, rtol=0, atol=0)
+                        if channel_model == "awgn":
+                            torch.testing.assert_close(shared_h, torch.ones_like(shared_h))
+                        if name == "uniform":
+                            torch.testing.assert_close(state["Q"], torch.eye(512))
+                        if mode == "oracle":
+                            torch.testing.assert_close(state["estimated_gain"], state["group_power"].sqrt())
+                        else:
+                            torch.testing.assert_close(state["estimated_gain"], torch.ones_like(state["estimated_gain"]))
+                    self.assertTrue((folder / "power_allocation.png").is_file())
+                    if strategy == "uniform":
+                        self.assertFalse((folder / "reconstructed.png").exists())
+                    if channel_model == "rayleigh" and strategy == "both" and allocated_mode == uniform_mode == "oracle":
+                        state = torch.load(folder / "allocated_baseband.pt", weights_only=True)
+                        transmission = prepare_segmentation_transmissions(
+                            state["clean_latent"], torch.zeros(1), allocator, RayleighFadingChannel(16, 32),
+                            torch.Generator().manual_seed(args.seed + 1), max_timestep=999,
+                        )
+                        restored, _ = restore_segmentation_transmissions(
+                            transmission, OrthogonalDDRM(tiny_reverse_model(), initialization_policy="clip"),
+                            torch.Generator().manual_seed(args.seed + 2),
+                        )
+                        torch.testing.assert_close(state["raw_received_latent"], transmission["strategies"]["allocated"]["raw_received"], rtol=0, atol=0)
+                        torch.testing.assert_close(state["restored_latent"], restored["allocated"], rtol=0, atol=0)
 
     def test_training_cli_saves_valid_checkpoint_and_resumes_optimizer_and_segmenter(self):
         from train_segmentation_power_allocator import run_training

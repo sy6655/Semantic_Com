@@ -585,7 +585,7 @@ class PosteriorSamplingTests(unittest.TestCase):
         import inference_power
 
         args = build_parser().parse_args(["--checkpoint", "power.pth"])
-        self.assertEqual(args.channel_model, "awgn")
+        self.assertIsNone(args.channel_model)  # Dataset-specific default is resolved from the checkpoint.
         self.assertEqual(args.restoration_method, "ddrm")
         self.assertEqual(args.uniform_receiver_mode, "oracle")
         self.assertIsNone(build_parser(include_legacy=True).parse_args(["--checkpoint", "power.pth"]).uniform_receiver_mode)
